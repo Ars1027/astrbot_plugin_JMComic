@@ -1,0 +1,116 @@
+{
+  "access_control": {
+    "description": "访问控制",
+    "type": "object",
+    "items": {
+      "enable_private_only": {
+        "description": "默认仅私聊可用",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，群聊必须加入群白名单才能使用。"
+      },
+      "group_whitelist": {
+        "description": "群聊白名单",
+        "type": "list",
+        "default": [],
+        "hint": "填写允许使用本插件的群号。"
+      },
+      "private_whitelist": {
+        "description": "私聊白名单",
+        "type": "list",
+        "default": [],
+        "hint": "留空表示所有私聊用户可用。"
+      }
+    }
+  },
+  "network": {
+    "description": "网络与 JMComic 客户端",
+    "type": "object",
+    "items": {
+      "proxy": {
+        "description": "代理地址",
+        "type": "string",
+        "default": "",
+        "hint": "例如 http://127.0.0.1:7890；留空则不显式使用代理。"
+      },
+      "client_impl": {
+        "description": "JMComic 客户端实现",
+        "type": "string",
+        "default": "api",
+        "options": ["api", "html"],
+        "hint": "异步下载使用 jmcomic 的 async_api；此项主要影响底层 option 兼容配置。"
+      },
+      "domains": {
+        "description": "JMComic 域名列表",
+        "type": "list",
+        "default": [],
+        "hint": "留空使用 jmcomic 内置域名；需要指定时填写域名，不带 https://。"
+      },
+      "cookies_avs": {
+        "description": "AVS Cookie",
+        "type": "string",
+        "default": "",
+        "hint": "部分内容需要登录态时填写 AVS cookie 值。"
+      }
+    }
+  },
+  "download": {
+    "description": "下载与导出",
+    "type": "object",
+    "items": {
+      "download_base_dir": {
+        "description": "下载数据目录",
+        "type": "string",
+        "default": "",
+        "hint": "留空则使用 AstrBot data/plugin_data/astrbot_plugin_JMComic。"
+      },
+      "max_concurrent_tasks": {
+        "description": "最大同时下载任务数",
+        "type": "int",
+        "default": 1,
+        "hint": "不建议太高，避免JMComic请求压力过高。"
+      },
+      "image_concurrency": {
+        "description": "图片下载并发数",
+        "type": "int",
+        "default": 10
+      },
+      "photo_concurrency": {
+        "description": "章节下载并发数",
+        "type": "int",
+        "default": 3
+      },
+      "default_export_format": {
+        "description": "默认导出格式",
+        "type": "string",
+        "default": "zip",
+        "options": ["zip", "pdf"]
+      },
+      "max_send_file_mb": {
+        "description": "直接发送文件大小上限 MB",
+        "type": "int",
+        "default": 80,
+        "hint": "超过后只回复本机保存路径。"
+      },
+      "file_delivery_mode": {
+        "description": "文件发送模式",
+        "type": "string",
+        "default": "onebot_group_file_base64",
+        "options": ["onebot_group_file_base64"],
+        "hint": "使用 OneBot upload_group_file 上传 base64:// 文件到群文件；需要在群聊中使用，并需要 NapCat/OneBot 支持 base64 文件参数。"
+      },
+      "max_base64_file_mb": {
+        "description": "base64 群文件上传大小上限 MB",
+        "type": "int",
+        "default": 512,
+        "hint": "PDF/ZIP 会先读入内存并编码为 base64，实际传输体积约增加 33%。超过该限制时只返回提示。"
+      },
+      "delete_original_after_export": {
+        "description": "导出后删除原始图片目录",
+        "type": "bool",
+        "default": true,
+        "hint": "开启可节省磁盘空间。"
+      }
+    }
+  }
+}
