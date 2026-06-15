@@ -14,7 +14,8 @@ JMComic 的 AstrBot 查询与异步下载插件。V1 支持搜索、详情查询
 - 默认导出 ZIP；PDF 导出依赖 `img2pdf`。
 - base64 会让实际传输体积增加约 33%，大文件可能被协议端拒绝。
 ## todo
-- 本子更新订阅功能
+- 本子收藏夹更新订阅功能
+- 分类/排行榜
 
 ## 🔗 感谢以下项目
 ### Python API for JMComic
