@@ -1,6 +1,15 @@
-# astrbot_plugin_JMComic
+<div align="center">
 
-JMComic 的 AstrBot 查询与异步下载插件。V1 支持搜索、详情查询、按 ID 下载，并导出 ZIP/PDF 文件。
+
+<img src="logo.png" width="256" alt="icon">
+
+# JMComic查询下载
+[![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-ff69b4?style=for-the-badge)](https://github.com/AstrBotDevs/AstrBot)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg?style=for-the-badge&color=76bad9)](https://www.python.org/)
+
+_✨ JMComic 的 AstrBot 查询与异步下载插件。V1 支持搜索、详情查询、按 ID 下载，并导出 ZIP/PDF 文件。✨_
+
+</div>
 
 ## 功能
 
