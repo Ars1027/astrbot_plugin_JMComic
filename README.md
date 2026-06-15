@@ -16,6 +16,14 @@ JMComic 的 AstrBot 查询与异步下载插件。V1 支持搜索、详情查询
 ## todo
 - 本子更新订阅功能
 
-## 🔗 相关链接
-- 感谢[MPython API for JMComic]("https://github.com/hect0x7/JMComic-Crawler-Python")提供 Python API 访问禁漫天堂
+## 🔗 感谢以下项目
+### Python API for JMComic
+
+<a href="https://github.com/hect0x7/JMComic-Crawler-Python">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github-readme-stats.vercel.app/api/pin/?username=hect0x7&repo=JMComic-Crawler-Python&theme=radical" />
+    <source media="(prefers-color-scheme: light)" srcset="https://github-readme-stats.vercel.app/api/pin/?username=hect0x7&repo=JMComic-Crawler-Python" />
+    <img alt="Repo Card" src="https://github-readme-stats.vercel.app/api/pin/?username=hect0x7&repo=JMComic-Crawler-Python" />
+  </picture>
+</a>
 
