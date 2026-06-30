@@ -1,7 +1,7 @@
 name: astrbot_plugin_JMComic
 display_name: JMComic查询下载
 desc: JMComic 的 AstrBot 查询与异步下载插件，支持搜索、详情、ZIP/PDF 导出和任务管理
-version: v0.1.0
+version: v0.2.0
 author: Ars1027
 support_platforms:
   - aiocqhttp

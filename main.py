@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import re
 import time
 from dataclasses import dataclass, field
@@ -20,13 +21,83 @@ PLUGIN_NAME = "astrbot_plugin_JMComic"
 KV_TASKS_KEY = "jmcomic_tasks"
 ACTIVE_STATUSES = {"pending", "running"}
 SUPPORTED_FORMATS = {"zip", "pdf"}
-FILE_DELIVERY_MODES = {"onebot_group_file_base64"}
+FILE_DELIVERY_MODES = {
+    "auto",
+    "napcat_http_stream",
+    "onebot_group_file_base64",
+}
 FORMAT_ALIASES = {
     "zip": "zip",
     "压缩": "zip",
     "压缩包": "zip",
     "pdf": "pdf",
 }
+RANKING_PERIOD_ALIASES = {
+    "日": "day",
+    "日榜": "day",
+    "今日": "day",
+    "今天": "day",
+    "day": "day",
+    "daily": "day",
+    "周": "week",
+    "周榜": "week",
+    "週": "week",
+    "週榜": "week",
+    "本周": "week",
+    "week": "week",
+    "weekly": "week",
+    "月": "month",
+    "月榜": "month",
+    "本月": "month",
+    "month": "month",
+    "monthly": "month",
+}
+RANKING_PERIOD_LABELS = {
+    "day": "日榜",
+    "week": "周榜",
+    "month": "月榜",
+}
+JM_CATEGORY_ALIASES = {
+    "0": "0",
+    "all": "0",
+    "全部": "0",
+    "同人": "doujin",
+    "doujin": "doujin",
+    "单本": "single",
+    "单行本": "single",
+    "single": "single",
+    "短篇": "short",
+    "短漫": "short",
+    "short": "short",
+    "其他": "another",
+    "another": "another",
+    "韩漫": "hanman",
+    "韓漫": "hanman",
+    "hanman": "hanman",
+    "美漫": "meiman",
+    "meiman": "meiman",
+    "cos": "doujin_cosplay",
+    "cosplay": "doujin_cosplay",
+    "doujin_cosplay": "doujin_cosplay",
+    "3d": "3D",
+    "英文": "english_site",
+    "英文站": "english_site",
+    "english": "english_site",
+    "english_site": "english_site",
+}
+JM_CATEGORY_LABELS = {
+    "0": "全部",
+    "doujin": "同人",
+    "single": "单本",
+    "short": "短篇",
+    "another": "其他",
+    "hanman": "韩漫",
+    "meiman": "美漫",
+    "doujin_cosplay": "Cosplay",
+    "3D": "3D",
+    "english_site": "英文站",
+}
+SUPPORTED_CATEGORY_HINT = "全部、同人、单本、短篇、其他、韩漫、美漫、cosplay、3d、英文"
 
 
 @dataclass
@@ -89,11 +160,44 @@ class JMComicTask:
         )
 
 
+@dataclass
+class JMSearchResult:
+    album_id: str
+    title: str
+    tags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class JMQuerySession:
+    kind: str
+    title: str
+    page_no: int
+    page_count: int | None = None
+    total: int | None = None
+    query: str = ""
+    period: str = "week"
+    category: str = "0"
+    items: list[JMSearchResult] = field(default_factory=list)
+    offset: int = 0
+    shown_count: int = 0
+    last_page_item_count: int = 0
+    updated_at: float = field(default_factory=time.time)
+
+    def touch(self) -> None:
+        self.updated_at = time.time()
+
+
+class NapCatHttpDeliveryError(RuntimeError):
+    def __init__(self, stage: str, message: str):
+        super().__init__(message)
+        self.stage = stage
+
+
 @register(
     PLUGIN_NAME,
     "Ars1027",
     "JMComic 的 AstrBot 查询与异步下载插件",
-    "v0.1.0",
+    "v0.2.0",
 )
 class JMComicPlugin(Star):
     def _cfg(self, block: str, key: str, default):
@@ -150,16 +254,59 @@ class JMComicPlugin(Star):
                 self._cfg(
                     "download",
                     "file_delivery_mode",
-                    "onebot_group_file_base64",
+                    "auto",
                 )
-                or "onebot_group_file_base64"
+                or "auto"
             )
         )
         self.max_base64_file_mb = max(
-            1, int(self._cfg("download", "max_base64_file_mb", 50) or 50)
+            1, int(self._cfg("download", "max_base64_file_mb", 80) or 80)
+        )
+        self.napcat_http_api_base = str(
+            self._cfg("download", "napcat_http_api_base", "") or ""
+        ).strip().rstrip("/")
+        self.napcat_http_access_token = str(
+            self._cfg("download", "napcat_http_access_token", "") or ""
+        ).strip()
+        self.napcat_http_timeout_seconds = max(
+            30,
+            int(
+                self._cfg("download", "napcat_http_timeout_seconds", 900)
+                or 900
+            ),
+        )
+        self.stream_chunk_kb = max(
+            64, int(self._cfg("download", "stream_chunk_kb", 512) or 512)
+        )
+        self.stream_file_retention_seconds = max(
+            60,
+            int(
+                self._cfg("download", "stream_file_retention_seconds", 1800)
+                or 1800
+            ),
+        )
+        self.stream_chunk_retries = max(
+            0, int(self._cfg("download", "stream_chunk_retries", 2) or 0)
         )
         self.delete_original_after_export = bool(
             self._cfg("download", "delete_original_after_export", True)
+        )
+        self.search_page_size = max(
+            1, int(self._cfg("query", "search_page_size", 10) or 10)
+        )
+        search_result_tag_limit = self._cfg("query", "search_result_tag_limit", 5)
+        self.search_result_tag_limit = max(
+            0,
+            int(5 if search_result_tag_limit is None else search_result_tag_limit),
+        )
+        self.search_more_ttl_seconds = max(
+            30, int(self._cfg("query", "search_more_ttl_seconds", 600) or 600)
+        )
+        self.search_enrich_tags = bool(
+            self._cfg("query", "search_enrich_tags", True)
+        )
+        self.search_enrich_tag_concurrency = max(
+            1, int(self._cfg("query", "search_enrich_tag_concurrency", 3) or 3)
         )
 
         configured_base_dir = str(
@@ -175,6 +322,7 @@ class JMComicPlugin(Star):
         self.export_dir = self.data_dir / "exports"
 
         self.tasks: dict[str, JMComicTask] = {}
+        self.query_sessions: dict[str, JMQuerySession] = {}
         self._task_lock = asyncio.Lock()
 
     async def initialize(self):
@@ -220,7 +368,7 @@ class JMComicPlugin(Star):
     @staticmethod
     def _normalize_file_delivery_mode(value: str) -> str:
         mode = value.strip().lower()
-        return mode if mode in FILE_DELIVERY_MODES else "onebot_group_file_base64"
+        return mode if mode in FILE_DELIVERY_MODES else "auto"
 
     @staticmethod
     def _parse_format_token(value: str) -> str | None:
@@ -249,7 +397,7 @@ class JMComicPlugin(Star):
         items = [str(item) for item in values if str(item).strip()]
         if not items:
             return "-"
-        if len(items) > limit:
+        if limit > 0 and len(items) > limit:
             return ", ".join(items[:limit]) + f" 等{len(items)}项"
         return ", ".join(items)
 
@@ -399,36 +547,315 @@ class JMComicPlugin(Star):
         async with self._task_lock:
             return sum(1 for task in self.tasks.values() if task.status in ACTIVE_STATUSES)
 
-    def _format_search_page(self, page: Any, query: str) -> str:
-        page_no = getattr(page, "page", None)
-        page_count = getattr(page, "page_count", None)
-        total = getattr(page, "total", None)
-        header = f"JMComic 搜索: {query}"
-        if page_no is not None and page_count is not None:
-            header += f" (第 {page_no}/{page_count} 页)"
-        elif total is not None:
-            header += f" (约 {total} 条)"
+    @staticmethod
+    def _int_or_none(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
-        rows = []
+    @staticmethod
+    def _normalize_tags(tags: Any) -> list[str]:
+        if not tags:
+            return []
+        if isinstance(tags, (str, int)):
+            tags = [tags]
+        result = []
+        for tag in tags:
+            text = str(tag).strip()
+            if text:
+                result.append(text)
+        return result
+
+    @staticmethod
+    def _coerce_search_result(item: Any) -> JMSearchResult | None:
+        if isinstance(item, JMSearchResult):
+            return item
+        if isinstance(item, dict):
+            album_id = item.get("album_id") or item.get("id") or item.get("aid")
+            title = item.get("title") or item.get("name") or item.get("album_name")
+            tags = item.get("tags") or item.get("tag") or []
+            if album_id and title:
+                return JMSearchResult(str(album_id), str(title), JMComicPlugin._normalize_tags(tags))
+            return None
+
+        if isinstance(item, (tuple, list)):
+            if len(item) >= 3:
+                album_id, title, tags = item[:3]
+            elif len(item) >= 2:
+                album_id, title = item[:2]
+                tags = []
+            else:
+                return None
+            return JMSearchResult(str(album_id), str(title), JMComicPlugin._normalize_tags(tags))
+
+        album_id = (
+            getattr(item, "album_id", None)
+            or getattr(item, "id", None)
+            or getattr(item, "aid", None)
+        )
+        title = (
+            getattr(item, "title", None)
+            or getattr(item, "name", None)
+            or getattr(item, "album_name", None)
+        )
+        if not album_id or not title:
+            return None
+        return JMSearchResult(
+            str(album_id),
+            str(title),
+            JMComicPlugin._normalize_tags(getattr(item, "tags", [])),
+        )
+
+    def _extract_page_results(self, page: Any) -> list[JMSearchResult]:
         try:
             iterator = page.iter_id_title_tag()
         except Exception:
-            iterator = ((aid, title, []) for aid, title in page)
+            try:
+                iterator = iter(page)
+            except TypeError:
+                iterator = iter(())
 
-        for index, item in enumerate(iterator, start=1):
-            if len(item) == 3:
-                album_id, title, tags = item
-            else:
-                album_id, title = item
-                tags = []
-            tag_text = self._limit_join(tags, 5)
-            rows.append(f"{index}. JM{album_id}  {title}\n   标签: {tag_text}")
-            if index >= 10:
-                break
+        results: list[JMSearchResult] = []
+        for item in iterator:
+            result = self._coerce_search_result(item)
+            if result is not None:
+                results.append(result)
+        return results
 
-        if not rows:
-            return f"{header}\n没有找到结果。"
-        return header + "\n" + "\n".join(rows)
+    def _page_no(self, page: Any, fallback: int) -> int:
+        return self._int_or_none(
+            getattr(page, "page", None)
+            or getattr(page, "page_no", None)
+            or getattr(page, "current_page", None)
+        ) or fallback
+
+    def _page_count(self, page: Any) -> int | None:
+        return self._int_or_none(
+            getattr(page, "page_count", None)
+            or getattr(page, "pages", None)
+            or getattr(page, "total_pages", None)
+        )
+
+    def _page_total(self, page: Any) -> int | None:
+        return self._int_or_none(
+            getattr(page, "total", None)
+            or getattr(page, "total_count", None)
+            or getattr(page, "count", None)
+        )
+
+    def _new_query_session(
+        self,
+        *,
+        kind: str,
+        title: str,
+        page: Any,
+        fallback_page: int,
+        query: str = "",
+        period: str = "week",
+        category: str = "0",
+    ) -> JMQuerySession:
+        items = self._extract_page_results(page)
+        page_no = self._page_no(page, fallback_page)
+        return JMQuerySession(
+            kind=kind,
+            title=title,
+            page_no=page_no,
+            page_count=self._page_count(page),
+            total=self._page_total(page),
+            query=query,
+            period=period,
+            category=category,
+            items=items,
+            last_page_item_count=len(items),
+        )
+
+    def _query_header(self, session: JMQuerySession) -> str:
+        header = session.title
+        if session.page_no is not None and session.page_count is not None:
+            header += f" (第 {session.page_no}/{session.page_count} 页)"
+        elif session.total is not None:
+            header += f" (约 {session.total} 条)"
+        return header
+
+    def _session_can_fetch_next_page(self, session: JMQuerySession) -> bool:
+        if session.page_count is not None:
+            return session.page_no < session.page_count
+        return session.last_page_item_count > 0
+
+    def _session_has_more(self, session: JMQuerySession) -> bool:
+        return session.offset < len(session.items) or self._session_can_fetch_next_page(session)
+
+    def _query_session_chunk(self, session: JMQuerySession) -> list[JMSearchResult]:
+        return session.items[session.offset: session.offset + self.search_page_size]
+
+    async def _fetch_album_tags(self, client: Any, album_id: str) -> list[str]:
+        album = await client.get_album_detail(album_id)
+        return self._normalize_tags(getattr(album, "tags", []))
+
+    async def _enrich_missing_tags(self, items: list[JMSearchResult]) -> None:
+        if not self.search_enrich_tags:
+            return
+
+        missing = [item for item in items if not item.tags]
+        if not missing:
+            return
+
+        option = self._build_option(self.data_dir / "query-cache")
+        semaphore = asyncio.Semaphore(self.search_enrich_tag_concurrency)
+        async with option.new_jm_async_client(
+            max_clients=self.search_enrich_tag_concurrency
+        ) as client:
+            async def enrich(item: JMSearchResult) -> None:
+                async with semaphore:
+                    try:
+                        tags = await self._fetch_album_tags(client, item.album_id)
+                    except Exception as exc:
+                        logger.warning(f"JMComic 标签补全失败 JM{item.album_id}: {exc}")
+                        return
+                    if tags:
+                        item.tags = tags
+
+            await asyncio.gather(*(enrich(item) for item in missing))
+
+    def _render_query_session_chunk_text(
+        self,
+        session: JMQuerySession,
+        chunk: list[JMSearchResult],
+    ) -> str:
+        header = self._query_header(session)
+        if not chunk:
+            return f"{header}\n没有更多结果。"
+
+        tag_limit = 0 if len(session.items) == 1 else self.search_result_tag_limit
+        rows = []
+        for index, item in enumerate(chunk, start=session.shown_count + 1):
+            tag_text = self._limit_join(item.tags, tag_limit)
+            rows.append(f"{index}. JM{item.album_id}  {item.title}\n   标签: {tag_text}")
+
+        session.offset += len(chunk)
+        session.shown_count += len(chunk)
+        session.touch()
+
+        lines = [header, *rows]
+        if self._session_has_more(session):
+            lines.append(f"发送“更多”继续显示，或使用 /jm更多。")
+        return "\n".join(lines)
+
+    async def _render_query_session_chunk(self, session: JMQuerySession) -> str:
+        chunk = self._query_session_chunk(session)
+        await self._enrich_missing_tags(chunk)
+        return self._render_query_session_chunk_text(session, chunk)
+
+    def _store_query_session(self, umo: str, session: JMQuerySession) -> None:
+        self._purge_expired_query_sessions()
+        self.query_sessions[umo] = session
+
+    def _get_query_session(self, umo: str) -> JMQuerySession | None:
+        session = self.query_sessions.get(umo)
+        if session is None:
+            return None
+        if time.time() - session.updated_at > self.search_more_ttl_seconds:
+            self.query_sessions.pop(umo, None)
+            return None
+        return session
+
+    def _purge_expired_query_sessions(self) -> None:
+        now = time.time()
+        expired = [
+            key
+            for key, session in self.query_sessions.items()
+            if now - session.updated_at > self.search_more_ttl_seconds
+        ]
+        for key in expired:
+            self.query_sessions.pop(key, None)
+
+    def _format_search_page(self, page: Any, query: str) -> str:
+        session = self._new_query_session(
+            kind="search",
+            title=f"JMComic 搜索: {query}",
+            page=page,
+            fallback_page=1,
+            query=query,
+        )
+        if not session.items:
+            return f"{self._query_header(session)}\n没有找到结果。"
+        return self._render_query_session_chunk_text(
+            session,
+            self._query_session_chunk(session),
+        )
+
+    async def _fetch_search_page(self, query: str, page: int):
+        option = self._build_option(self.data_dir / "query-cache")
+        async with option.new_jm_async_client(max_clients=3) as client:
+            return await client.search_site(query, page=page)
+
+    async def _fetch_ranking_page(self, period: str, category: str, page: int):
+        option = self._build_option(self.data_dir / "query-cache")
+        method_name = f"{period}_ranking"
+        async with option.new_jm_async_client(max_clients=3) as client:
+            method = getattr(client, method_name)
+            return await method(page=page, category=category)
+
+    def _parse_ranking_args(self, arg_text: str) -> tuple[str, str, int, str]:
+        period = "week"
+        category = "0"
+        page = 1
+        for token in arg_text.split():
+            text = token.strip()
+            if not text:
+                continue
+            if text.isdigit():
+                page = max(1, int(text))
+                continue
+            period_key = text.lower()
+            normalized_period = RANKING_PERIOD_ALIASES.get(period_key)
+            if normalized_period:
+                period = normalized_period
+                continue
+            category_key = text.lower()
+            normalized_category = JM_CATEGORY_ALIASES.get(category_key)
+            if normalized_category:
+                category = normalized_category
+                continue
+            return "", "", 1, f"未知热门榜分类或时间参数: {text}\n支持分类: {SUPPORTED_CATEGORY_HINT}"
+        return period, category, page, ""
+
+    async def _build_more_response(self, event: AstrMessageEvent) -> str:
+        session = self._get_query_session(event.unified_msg_origin)
+        if session is None:
+            return "当前会话没有可继续显示的 JMComic 搜索或热门榜结果。"
+
+        if session.offset >= len(session.items):
+            if not self._session_can_fetch_next_page(session):
+                return "当前会话的 JMComic 结果已经显示完了。"
+            next_page = session.page_no + 1
+            try:
+                if session.kind == "ranking":
+                    page = await self._fetch_ranking_page(
+                        session.period,
+                        session.category,
+                        next_page,
+                    )
+                else:
+                    page = await self._fetch_search_page(session.query, next_page)
+            except Exception as exc:
+                logger.warning(f"JMComic 更多结果获取失败: {exc}")
+                return f"获取更多结果失败: {exc}"
+
+            session.items = self._extract_page_results(page)
+            session.offset = 0
+            session.page_no = self._page_no(page, next_page)
+            session.page_count = self._page_count(page)
+            session.total = self._page_total(page)
+            session.last_page_item_count = len(session.items)
+            session.touch()
+            if not session.items:
+                return "当前会话的 JMComic 结果已经显示完了。"
+
+        return await self._render_query_session_chunk(session)
 
     def _format_album_detail(self, album: Any) -> str:
         lines = [
@@ -494,6 +921,15 @@ class JMComicPlugin(Star):
             return await value
         return value
 
+    def _group_delivery_target(self, task: JMComicTask) -> int | str:
+        if not task.delivery_is_group:
+            raise RuntimeError(
+                "群文件上传仅支持群聊，请在已加入白名单的群内使用 /jm下载。"
+            )
+        if not task.delivery_session_id:
+            raise RuntimeError("当前任务缺少群号，无法上传群文件。")
+        return self._normalize_onebot_id(task.delivery_session_id)
+
     async def _call_onebot_group_file_upload(
         self, task: JMComicTask, file_value: str, display_name: str
     ) -> None:
@@ -502,11 +938,7 @@ class JMComicPlugin(Star):
             raise RuntimeError(
                 "当前任务没有可用的 OneBot bot client，无法上传群文件。"
             )
-        if not task.delivery_is_group:
-            raise RuntimeError("群文件上传仅支持群聊，请在已加入白名单的群内使用 /jm下载。")
-        if not task.delivery_session_id:
-            raise RuntimeError("当前任务缺少群号，无法上传群文件。")
-        target = self._normalize_onebot_id(task.delivery_session_id)
+        target = self._group_delivery_target(task)
         call_action = getattr(bot, "call_action", None)
         if callable(call_action):
             await self._maybe_await(
@@ -537,15 +969,218 @@ class JMComicPlugin(Star):
         encoded_file = "base64://" + base64.b64encode(file_bytes).decode("ascii")
         await self._call_onebot_group_file_upload(task, encoded_file, display_name)
 
+    def _napcat_http_headers(self) -> dict[str, str]:
+        headers = {}
+        if self.napcat_http_access_token:
+            headers["Authorization"] = f"Bearer {self.napcat_http_access_token}"
+        return headers
+
+    def _create_napcat_http_session(self):
+        import aiohttp
+
+        timeout = aiohttp.ClientTimeout(total=self.napcat_http_timeout_seconds)
+        return aiohttp.ClientSession(headers=self._napcat_http_headers(), timeout=timeout)
+
+    async def _napcat_http_post(
+        self,
+        session: Any,
+        action: str,
+        payload: dict[str, Any],
+    ) -> Any:
+        url = f"{self.napcat_http_api_base}/{action}"
+        try:
+            async with session.post(url, json=payload) as response:
+                status_code = int(getattr(response, "status", 0) or 0)
+                try:
+                    body = await response.json(content_type=None)
+                except Exception as exc:
+                    raw_text = await response.text()
+                    raise RuntimeError(
+                        f"NapCat HTTP 返回非 JSON 响应 ({status_code}): {raw_text[:300]}"
+                    ) from exc
+        except Exception as exc:
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError(f"请求 NapCat HTTP API 失败: {exc}") from exc
+
+        if status_code < 200 or status_code >= 300:
+            raise RuntimeError(f"NapCat HTTP {status_code}: {body}")
+        if not isinstance(body, dict):
+            raise RuntimeError(f"NapCat HTTP 返回格式异常: {body!r}")
+        if body.get("status") == "failed" or int(body.get("retcode", 0) or 0) != 0:
+            message = body.get("message") or body.get("wording") or body
+            raise RuntimeError(f"NapCat action {action} 失败: {message}")
+        return body.get("data", body)
+
+    @staticmethod
+    def _calculate_file_sha256(output_path: Path) -> str:
+        digest = hashlib.sha256()
+        with output_path.open("rb") as file_obj:
+            while True:
+                block = file_obj.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+        return digest.hexdigest()
+
+    async def _upload_stream_chunk_with_retry(
+        self,
+        session: Any,
+        payload: dict[str, Any],
+    ) -> Any:
+        chunk_index = int(payload["chunk_index"])
+        last_error: Exception | None = None
+        for attempt in range(self.stream_chunk_retries + 1):
+            try:
+                return await self._napcat_http_post(
+                    session,
+                    "upload_file_stream",
+                    payload,
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self.stream_chunk_retries:
+                    break
+                await asyncio.sleep(0)
+        raise NapCatHttpDeliveryError(
+            "stream_transfer",
+            f"分片 {chunk_index + 1} 上传失败: {last_error}",
+        )
+
+    async def _upload_napcat_http_stream_group_file(
+        self,
+        task: JMComicTask,
+        output_path: Path,
+        display_name: str,
+    ) -> None:
+        if not self.napcat_http_api_base:
+            raise NapCatHttpDeliveryError(
+                "configuration",
+                "未配置 napcat_http_api_base，无法使用 NapCat HTTP Stream。",
+            )
+
+        target = self._group_delivery_target(task)
+        file_size = output_path.stat().st_size
+        if file_size <= 0:
+            raise NapCatHttpDeliveryError("stream_transfer", "导出文件大小为 0。")
+
+        chunk_size = self.stream_chunk_kb * 1024
+        total_chunks = (file_size + chunk_size - 1) // chunk_size
+        stream_id = uuid4().hex
+        retention_ms = self.stream_file_retention_seconds * 1000
+        sha256 = await asyncio.to_thread(self._calculate_file_sha256, output_path)
+
+        try:
+            async with self._create_napcat_http_session() as session:
+                with output_path.open("rb") as file_obj:
+                    for chunk_index in range(total_chunks):
+                        chunk_data = await asyncio.to_thread(file_obj.read, chunk_size)
+                        if not chunk_data:
+                            raise NapCatHttpDeliveryError(
+                                "stream_transfer",
+                                f"读取分片 {chunk_index + 1} 时提前到达文件末尾。",
+                            )
+                        payload = {
+                            "stream_id": stream_id,
+                            "chunk_data": base64.b64encode(chunk_data).decode("ascii"),
+                            "chunk_index": chunk_index,
+                            "total_chunks": total_chunks,
+                            "file_size": file_size,
+                            "expected_sha256": sha256,
+                            "filename": display_name,
+                            "file_retention": retention_ms,
+                        }
+                        await self._upload_stream_chunk_with_retry(session, payload)
+
+                try:
+                    result = await self._napcat_http_post(
+                        session,
+                        "upload_file_stream",
+                        {"stream_id": stream_id, "is_complete": True},
+                    )
+                except Exception as exc:
+                    raise NapCatHttpDeliveryError(
+                        "stream_finalize",
+                        f"NapCat 合并流式文件失败: {exc}",
+                    ) from exc
+
+                if not isinstance(result, dict) or result.get("status") != "file_complete":
+                    raise NapCatHttpDeliveryError(
+                        "stream_finalize",
+                        f"NapCat 流式文件状态异常: {result!r}",
+                    )
+                napcat_file_path = str(result.get("file_path", "") or "").strip()
+                if not napcat_file_path:
+                    raise NapCatHttpDeliveryError(
+                        "stream_finalize",
+                        "NapCat 未返回流式文件路径。",
+                    )
+
+                try:
+                    await self._napcat_http_post(
+                        session,
+                        "upload_group_file",
+                        {
+                            "group_id": str(target),
+                            "file": napcat_file_path,
+                            "name": display_name,
+                            "upload_file": True,
+                        },
+                    )
+                except Exception as exc:
+                    raise NapCatHttpDeliveryError(
+                        "group_upload",
+                        f"NapCat 上传 QQ 群文件失败: {exc}",
+                    ) from exc
+        except NapCatHttpDeliveryError:
+            raise
+        except Exception as exc:
+            raise NapCatHttpDeliveryError(
+                "stream_transfer",
+                f"NapCat HTTP Stream 传输失败: {exc}",
+            ) from exc
+
     def _group_file_delivery_failure_text(
         self, text: str, output_path: Path, exc: Exception
     ) -> str:
         return (
             text
             + "\nbase64 群文件上传失败，已保存在本机:"
+            + f"\n{output_path}"
             + "\n诊断: 当前 NapCat/OneBot 可能不支持 upload_group_file 的 base64:// 文件参数，"
             + "或当前会话不是群聊。"
             + "\n可回退方案: 共享 AstrBot 与协议端文件目录，或配置 AstrBot callback_api_base。"
+            + f"\n错误: {exc}"
+        )
+
+    def _http_stream_delivery_failure_text(
+        self,
+        text: str,
+        output_path: Path,
+        exc: Exception,
+    ) -> str:
+        stage = getattr(exc, "stage", "stream_transfer")
+        stage_labels = {
+            "configuration": "NapCat HTTP Stream 配置不完整",
+            "stream_transfer": "文件分块传输到 NapCat 失败",
+            "stream_finalize": "NapCat 合并流式文件失败",
+            "group_upload": "NapCat 上传 QQ 群文件失败",
+        }
+        diagnosis = stage_labels.get(stage, "NapCat HTTP Stream 发送失败")
+        advice = (
+            "请确认 NapCat HTTP Server 已启用、两个容器位于同一 Docker 网络，"
+            "且 napcat_http_api_base 与 Token 配置正确。"
+        )
+        if stage == "group_upload":
+            advice = (
+                "文件已经传到 NapCat，但上传 QQ 群文件失败；请检查 NapCat 日志、"
+                "群文件空间和 Bot 的群文件权限。"
+            )
+        return (
+            text
+            + f"\n{diagnosis}，原文件仍保存在 AstrBot:"
+            + f"\n{output_path}"
+            + f"\n诊断: {advice}"
             + f"\n错误: {exc}"
         )
 
@@ -570,15 +1205,50 @@ class JMComicPlugin(Star):
         )
 
         max_bytes = self.max_base64_file_mb * 1024 * 1024
+        use_http_stream = self.file_delivery_mode == "napcat_http_stream" or (
+            self.file_delivery_mode == "auto" and size > max_bytes
+        )
+        display_name = self._safe_send_filename(output_path, task)
+
+        if use_http_stream:
+            if not self.napcat_http_api_base:
+                exc = NapCatHttpDeliveryError(
+                    "configuration",
+                    "未配置 napcat_http_api_base，无法使用 NapCat HTTP Stream。",
+                )
+                await self._send_message(
+                    task.umo,
+                    self._http_stream_delivery_failure_text(text, output_path, exc),
+                )
+                return
+            await self._send_message(
+                task.umo,
+                text
+                + "\n文件较大，正在通过 NapCat HTTP Stream 分块传输并上传群文件。",
+            )
+            try:
+                await self._upload_napcat_http_stream_group_file(
+                    task,
+                    output_path,
+                    display_name,
+                )
+                await self._send_message(task.umo, text + "\n文件已上传到群文件。")
+            except Exception as exc:
+                logger.warning(f"上传 JMComic NapCat HTTP Stream 群文件失败: {exc}")
+                await self._send_message(
+                    task.umo,
+                    self._http_stream_delivery_failure_text(text, output_path, exc),
+                )
+            return
+
         if size > max_bytes:
             await self._send_message(
                 task.umo,
                 text
-                + f"\n文件超过 base64 群文件上传限制 {self.max_base64_file_mb} MB，已保存在本机",
+                + f"\n文件超过 base64 群文件上传限制 {self.max_base64_file_mb} MB，已保存在本机"
+                + f"\n{output_path}",
             )
             return
-
-        display_name = self._safe_send_filename(output_path, task)
 
         try:
             await self._upload_onebot_base64_group_file(task, output_path, display_name)
@@ -687,10 +1357,13 @@ class JMComicPlugin(Star):
         yield event.plain_result(
             "JMComic 插件指令:\n"
             "/jm搜索 <关键词> [页码]\n"
+            "/jm热门 [日|周|月] [分类] [页码]\n"
+            "/jm更多 或直接发送“更多”\n"
             "/jm详情 <id>\n"
             "/jm下载 <id> [zip|pdf]\n"
             "/jm任务\n"
             "/jm取消 <task_id>\n\n"
+            f"热门榜分类: {SUPPORTED_CATEGORY_HINT}\n"
             "默认仅私聊可用；群聊需在插件配置中加入白名单。"
         )
 
@@ -717,14 +1390,87 @@ class JMComicPlugin(Star):
             yield event.plain_result("请提供搜索关键词。")
             return
 
+        self.query_sessions.pop(event.unified_msg_origin, None)
         try:
-            option = self._build_option(self.data_dir / "query-cache")
-            async with option.new_jm_async_client(max_clients=3) as client:
-                result_page = await client.search_site(query, page=page)
-            yield event.plain_result(self._format_search_page(result_page, query))
+            result_page = await self._fetch_search_page(query, page)
+            session = self._new_query_session(
+                kind="search",
+                title=f"JMComic 搜索: {query}",
+                page=result_page,
+                fallback_page=page,
+                query=query,
+            )
+            if not session.items:
+                yield event.plain_result(f"{self._query_header(session)}\n没有找到结果。")
+                return
+            text = await self._render_query_session_chunk(session)
+            self._store_query_session(event.unified_msg_origin, session)
+            yield event.plain_result(text)
         except Exception as exc:
             logger.warning(f"JMComic 搜索失败: {exc}")
             yield event.plain_result(f"搜索失败: {exc}")
+
+    @filter.command("jm热门", alias={"jm排行", "jmranking"})
+    async def ranking(self, event: AstrMessageEvent):
+        allowed, reason = self._is_allowed(event)
+        if not allowed:
+            event.stop_event()
+            yield event.plain_result(reason)
+            return
+
+        event.stop_event()
+        arg_text = self._strip_command(event, "jm热门", "jm排行", "jmranking")
+        period, category, page, error = self._parse_ranking_args(arg_text)
+        if error:
+            yield event.plain_result(error)
+            return
+
+        self.query_sessions.pop(event.unified_msg_origin, None)
+        try:
+            result_page = await self._fetch_ranking_page(period, category, page)
+            period_label = RANKING_PERIOD_LABELS.get(period, period)
+            category_label = JM_CATEGORY_LABELS.get(category, category)
+            session = self._new_query_session(
+                kind="ranking",
+                title=f"JMComic 热门榜: {period_label} / {category_label}",
+                page=result_page,
+                fallback_page=page,
+                period=period,
+                category=category,
+            )
+            if not session.items:
+                yield event.plain_result(f"{self._query_header(session)}\n没有找到结果。")
+                return
+            text = await self._render_query_session_chunk(session)
+            self._store_query_session(event.unified_msg_origin, session)
+            yield event.plain_result(text)
+        except Exception as exc:
+            logger.warning(f"JMComic 热门榜查询失败: {exc}")
+            yield event.plain_result(f"热门榜查询失败: {exc}")
+
+    @filter.command("jm更多", alias={"jmmore"})
+    async def more(self, event: AstrMessageEvent):
+        allowed, reason = self._is_allowed(event)
+        if not allowed:
+            event.stop_event()
+            yield event.plain_result(reason)
+            return
+
+        event.stop_event()
+        yield event.plain_result(await self._build_more_response(event))
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_more_message(self, event: AstrMessageEvent):
+        text = (event.message_str or "").strip()
+        if text != "更多":
+            return
+
+        allowed, reason = self._is_allowed(event)
+        event.stop_event()
+        if not allowed:
+            yield event.plain_result(reason)
+            return
+        yield event.plain_result(await self._build_more_response(event))
 
     @filter.command("jm详情", alias={"jminfo"})
     async def detail(self, event: AstrMessageEvent):

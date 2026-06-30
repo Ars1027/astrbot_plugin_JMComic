@@ -54,6 +54,42 @@
       }
     }
   },
+  "query": {
+    "description": "查询展示",
+    "type": "object",
+    "items": {
+      "search_page_size": {
+        "description": "单次展示结果数",
+        "type": "int",
+        "default": 10,
+        "hint": "搜索和热门榜每次最多展示多少条；还有结果时可发送“更多”继续。"
+      },
+      "search_result_tag_limit": {
+        "description": "多结果标签展示数",
+        "type": "int",
+        "default": 5,
+        "hint": "多条结果时每条最多展示多少个标签；设为 0 表示不截断。单条结果始终完整展示标签。"
+      },
+      "search_more_ttl_seconds": {
+        "description": "更多结果缓存时间",
+        "type": "int",
+        "default": 600,
+        "hint": "最近一次搜索或热门榜结果可继续发送“更多”的时间窗口，单位秒。"
+      },
+      "search_enrich_tags": {
+        "description": "自动补全搜索标签",
+        "type": "bool",
+        "default": true,
+        "hint": "API 搜索结果可能不带标签；开启后会为当前展示的结果拉取详情补全标签。"
+      },
+      "search_enrich_tag_concurrency": {
+        "description": "标签补全并发数",
+        "type": "int",
+        "default": 3,
+        "hint": "补全搜索/热门榜标签时最多同时请求多少个详情。"
+      }
+    }
+  },
   "download": {
     "description": "下载与导出",
     "type": "object",
@@ -95,15 +131,51 @@
       "file_delivery_mode": {
         "description": "文件发送模式",
         "type": "string",
-        "default": "onebot_group_file_base64",
-        "options": ["onebot_group_file_base64"],
-        "hint": "使用 OneBot upload_group_file 上传 base64:// 文件到群文件；需要在群聊中使用，并需要 NapCat/OneBot 支持 base64 文件参数。"
+        "default": "auto",
+        "options": ["auto", "napcat_http_stream", "onebot_group_file_base64"],
+        "hint": "auto：小文件使用 Base64，超过阈值后使用 NapCat HTTP Stream；napcat_http_stream：全部使用流式上传；onebot_group_file_base64：保留旧模式。"
       },
       "max_base64_file_mb": {
-        "description": "base64 群文件上传大小上限 MB",
+        "description": "Base64 直传阈值 MB",
+        "type": "int",
+        "default": 80,
+        "hint": "auto 模式下超过该阈值会切换到 NapCat HTTP Stream；强制 Base64 模式下超过后只返回保存路径。"
+      },
+      "napcat_http_api_base": {
+        "description": "NapCat HTTP API 地址",
+        "type": "string",
+        "default": "",
+        "hint": "例如 http://napcat:3000。AstrBot 与 NapCat 容器需要位于同一 Docker 网络。"
+      },
+      "napcat_http_access_token": {
+        "description": "NapCat HTTP Access Token",
+        "type": "string",
+        "default": "",
+        "hint": "与 NapCat WebUI 中 HTTP Server 配置的 Token 保持一致；未设置 Token 时留空。"
+      },
+      "napcat_http_timeout_seconds": {
+        "description": "NapCat HTTP 超时时间（秒）",
+        "type": "int",
+        "default": 900,
+        "hint": "覆盖大文件上传到 QQ 群文件所需的完整等待时间。"
+      },
+      "stream_chunk_kb": {
+        "description": "Stream 分片大小 KB",
         "type": "int",
         "default": 512,
-        "hint": "PDF/ZIP 会先读入内存并编码为 base64，实际传输体积约增加 33%。超过该限制时只返回提示。"
+        "hint": "每个分片会单独 Base64 编码并通过 HTTP 发送；通常无需修改。"
+      },
+      "stream_file_retention_seconds": {
+        "description": "NapCat 临时文件保留时间（秒）",
+        "type": "int",
+        "default": 1800,
+        "hint": "NapCat 合并分片后保留临时文件的时间，需覆盖最终群文件上传耗时。"
+      },
+      "stream_chunk_retries": {
+        "description": "Stream 分片重试次数",
+        "type": "int",
+        "default": 2,
+        "hint": "单个分片请求失败后的额外重试次数。"
       },
       "delete_original_after_export": {
         "description": "导出后删除原始图片目录",
