@@ -1,3 +1,4 @@
 jmcomic>=2.7.0
 img2pdf>=0.5.1
 aiohttp>=3.9.0
+tzdata

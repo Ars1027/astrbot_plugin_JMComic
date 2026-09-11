@@ -23,6 +23,43 @@
       }
     }
   },
+  "recommendation": {
+    "description": "每日推荐",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "开启每日定时推送",
+        "type": "bool",
+        "default": false,
+        "hint": "仅控制定时推送；关闭时仍可使用 /jm推荐。修改配置后重载插件生效。"
+      },
+      "time": {
+        "description": "每日推送时间",
+        "type": "string",
+        "default": "09:00",
+        "hint": "24 小时制 HH:MM，按下方时区执行；不补发停机期间错过的推送。"
+      },
+      "timezone": {
+        "description": "推送时区",
+        "type": "string",
+        "default": "Asia/Shanghai",
+        "hint": "IANA 时区名称；同时用于判定每日推荐的日期。"
+      },
+      "top_n": {
+        "description": "日榜候选数量",
+        "type": "string",
+        "default": "10",
+        "options": ["3", "10"],
+        "hint": "从全部分类日榜前 3 或前 10 名随机选一本；同一天结果共享，修改后次日采用新数量。"
+      },
+      "targets": {
+        "description": "推荐接收会话",
+        "type": "list",
+        "default": [],
+        "hint": "在目标群聊或私聊发送 /sid，填入完整会话 ID（如机器人实例ID:GroupMessage:群号 或 机器人实例ID:FriendMessage:QQ号），每项一个。仍受插件访问控制限制，不自动推送所有白名单会话。"
+      }
+    }
+  },
   "network": {
     "description": "网络与 JMComic 客户端",
     "type": "object",

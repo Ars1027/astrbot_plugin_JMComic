@@ -14,7 +14,11 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-import astrbot.api.message_components as Comp
+
+if __package__:
+    from .recommendation import DailyRecommendation
+else:
+    from recommendation import DailyRecommendation
 
 
 PLUGIN_NAME = "astrbot_plugin_JMComic"
@@ -197,7 +201,7 @@ class NapCatHttpDeliveryError(RuntimeError):
     PLUGIN_NAME,
     "Ars1027",
     "JMComic 的 AstrBot 查询与异步下载插件",
-    "v0.2.0",
+    "v0.3.0",
 )
 class JMComicPlugin(Star):
     def _cfg(self, block: str, key: str, default):
@@ -324,14 +328,17 @@ class JMComicPlugin(Star):
         self.tasks: dict[str, JMComicTask] = {}
         self.query_sessions: dict[str, JMQuerySession] = {}
         self._task_lock = asyncio.Lock()
+        self.recommendation = DailyRecommendation(self)
 
     async def initialize(self):
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.export_dir.mkdir(parents=True, exist_ok=True)
         await self._load_task_snapshots()
+        await self.recommendation.initialize()
         logger.info(f"JMComic 插件已初始化，数据目录: {self.data_dir}")
 
     async def terminate(self):
+        await self.recommendation.close()
         handles = [
             task.task_handle
             for task in self.tasks.values()
@@ -440,7 +447,9 @@ class JMComicPlugin(Star):
         return getattr(message_obj, "bot", None)
 
     def _is_allowed(self, event: AstrMessageEvent) -> tuple[bool, str]:
-        group_id = self._group_id(event)
+        return self._is_session_allowed(self._group_id(event), self._sender_id(event))
+
+    def _is_session_allowed(self, group_id: str | None, sender_id: str) -> tuple[bool, str]:
         if group_id:
             if self.group_whitelist:
                 if group_id in self.group_whitelist:
@@ -450,7 +459,6 @@ class JMComicPlugin(Star):
                 return False, "JMComic 插件默认仅私聊可用；群聊请先配置白名单。"
             return True, ""
 
-        sender_id = self._sender_id(event)
         if self.private_whitelist and sender_id not in self.private_whitelist:
             return False, "你不在 JMComic 插件私聊白名单中。"
         return True, ""
@@ -741,7 +749,7 @@ class JMComicPlugin(Star):
 
         lines = [header, *rows]
         if self._session_has_more(session):
-            lines.append(f"发送“更多”继续显示，或使用 /jm更多。")
+            lines.append("发送“更多”继续显示，或使用 /jm更多。")
         return "\n".join(lines)
 
     async def _render_query_session_chunk(self, session: JMQuerySession) -> str:
@@ -1360,12 +1368,27 @@ class JMComicPlugin(Star):
             "/jm热门 [日|周|月] [分类] [页码]\n"
             "/jm更多 或直接发送“更多”\n"
             "/jm详情 <id>\n"
+            "/jm推荐（查看今日统一推荐，含封面与标签）\n"
             "/jm下载 <id> [zip|pdf]\n"
             "/jm任务\n"
             "/jm取消 <task_id>\n\n"
             f"热门榜分类: {SUPPORTED_CATEGORY_HINT}\n"
             "默认仅私聊可用；群聊需在插件配置中加入白名单。"
         )
+
+    @filter.command("jm推荐", alias={"jmrecommend"})
+    async def recommend(self, event: AstrMessageEvent):
+        allowed, reason = self._is_allowed(event)
+        event.stop_event()
+        if not allowed:
+            yield event.plain_result(reason)
+            return
+        try:
+            state, cover = await self.recommendation.get_today()
+            yield event.chain_result(self.recommendation.message(state, cover).chain)
+        except Exception as exc:
+            logger.warning(f"JMComic 每日推荐获取失败: {exc}")
+            yield event.plain_result(f"每日推荐获取失败: {exc}")
 
     @filter.command("jm搜索", alias={"jmsearch"})
     async def search(self, event: AstrMessageEvent):
