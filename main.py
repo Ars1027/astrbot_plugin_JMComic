@@ -201,7 +201,7 @@ class NapCatHttpDeliveryError(RuntimeError):
     PLUGIN_NAME,
     "Ars1027",
     "JMComic 的 AstrBot 查询与异步下载插件",
-    "v0.3.0",
+    "v0.3.1",
 )
 class JMComicPlugin(Star):
     def _cfg(self, block: str, key: str, default):
@@ -807,6 +807,21 @@ class JMComicPlugin(Star):
             method = getattr(client, method_name)
             return await method(page=page, category=category)
 
+    async def _fetch_recommendation_page(self, page: int, order_by: str):
+        import jmcomic
+
+        constants = jmcomic.JmMagicConstants
+        option = self._build_option(self.data_dir / "query-cache")
+        async with option.new_jm_async_client(max_clients=3) as client:
+            return await client.categories_filter(
+                page=page,
+                time=constants.TIME_ALL,
+                category=constants.CATEGORY_ALL,
+                order_by=(
+                    constants.ORDER_BY_VIEW if order_by == "mv" else constants.ORDER_BY_LATEST
+                ),
+            )
+
     def _parse_ranking_args(self, arg_text: str) -> tuple[str, str, int, str]:
         period = "week"
         category = "0"
@@ -1369,6 +1384,7 @@ class JMComicPlugin(Star):
             "/jm更多 或直接发送“更多”\n"
             "/jm详情 <id>\n"
             "/jm推荐（查看今日统一推荐，含封面与标签）\n"
+            "/jm重置推荐（管理员：清空今日推荐和推送记录，不立即群发）\n"
             "/jm下载 <id> [zip|pdf]\n"
             "/jm任务\n"
             "/jm取消 <task_id>\n\n"
@@ -1389,6 +1405,26 @@ class JMComicPlugin(Star):
         except Exception as exc:
             logger.warning(f"JMComic 每日推荐获取失败: {exc}")
             yield event.plain_result(f"每日推荐获取失败: {exc}")
+
+    @filter.command("jm重置推荐", alias={"jmresetrecommend"})
+    async def reset_recommendation(self, event: AstrMessageEvent):
+        event.stop_event()
+        if not event.is_admin():
+            yield event.plain_result("仅 AstrBot 管理员可以重置每日推荐。")
+            return
+        allowed, reason = self._is_allowed(event)
+        if not allowed:
+            yield event.plain_result(reason)
+            return
+        try:
+            await self.recommendation.reset_today()
+            yield event.plain_result(
+                "已清空所有会话共享的今日推荐及推送记录。\n"
+                "使用 /jm推荐 重新抽取；重置不会立即群发，也不会补发已错过的定时推送。"
+            )
+        except Exception as exc:
+            logger.warning(f"JMComic 每日推荐重置失败: {exc}")
+            yield event.plain_result(f"每日推荐重置失败: {exc}")
 
     @filter.command("jm搜索", alias={"jmsearch"})
     async def search(self, event: AstrMessageEvent):

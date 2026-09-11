@@ -25,6 +25,9 @@ class _Image:
 
 
 class _Event(_FakeEvent):
+    def is_admin(self):
+        return getattr(self, "role", "member") == "admin"
+
     def chain_result(self, chain):
         return chain
 
@@ -64,7 +67,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
 
         plugin.get_kv_data = mock.AsyncMock(side_effect=load)
         plugin.put_kv_data = mock.AsyncMock(side_effect=save)
-        plugin._fetch_ranking_page = mock.AsyncMock(
+        plugin._fetch_recommendation_page = mock.AsyncMock(
             return_value=_FakePage([(str(i), f"标题{i}", []) for i in range(1, 21)])
         )
         service = plugin.recommendation
@@ -80,8 +83,8 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
     def saved(self):
         return self.storage[self.module.KV_RECOMMENDATION_KEY]
 
-    async def test_candidates_are_exact_top_three_or_ten(self):
-        for count in (3, 10):
+    async def test_candidates_accept_arbitrary_positive_n(self):
+        for count in (1, 3, 7, 10, 19):
             with self.subTest(count=count):
                 self.storage.clear()
                 plugin = self.make_plugin(
@@ -97,19 +100,201 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
                     [str(i) for i in range(1, count + 1)],
                 )
                 self.assertEqual(state.album_id, str(count))
-                plugin._fetch_ranking_page.assert_awaited_once_with("day", "0", 1)
+                plugin._fetch_recommendation_page.assert_awaited_once_with(1, "mr")
 
     async def test_short_and_empty_rankings(self):
-        self.plugin._fetch_ranking_page.return_value = _FakePage([])
+        self.plugin._fetch_recommendation_page.return_value = _FakePage([])
         with self.assertRaisesRegex(ValueError, "暂无"):
             await self.service.get_today()
         self.assertEqual(self.storage, {})
-        self.plugin._fetch_ranking_page.return_value = _FakePage([("17", "短榜", [])])
+        self.plugin._fetch_recommendation_page.return_value = _FakePage(
+            [("17", "短榜", [])]
+        )
         state, _ = await self.service.get_today()
         self.assertEqual(state.album_id, "17")
 
+    async def test_large_n_fetches_multiple_pages_and_trims_last_page(self):
+        self.service.top_n = 5
+        self.plugin._fetch_recommendation_page.side_effect = [
+            _FakePage([("1", "a", []), ("2", "b", [])], page_count=3),
+            _FakePage([("3", "c", []), ("4", "d", [])], page=2, page_count=3),
+            _FakePage([("5", "e", []), ("6", "f", [])], page=3, page_count=3),
+        ]
+        with mock.patch.object(
+            self.module.random, "choice", side_effect=lambda rows: rows[-1]
+        ) as choose:
+            state, _ = await self.service.get_today()
+        self.assertEqual(state.album_id, "5")
+        self.assertEqual(
+            [row.album_id for row in choose.call_args.args[0]],
+            ["1", "2", "3", "4", "5"],
+        )
+        self.assertEqual(
+            self.plugin._fetch_recommendation_page.await_args_list,
+            [mock.call(1, "mr"), mock.call(2, "mr"), mock.call(3, "mr")],
+        )
+
+    async def test_repeated_page_stops_without_duplicate_candidates(self):
+        self.service.top_n = 100
+        page = _FakePage([("1", "a", []), ("2", "b", [])], page_count=None)
+        self.plugin._fetch_recommendation_page.return_value = page
+        with mock.patch.object(
+            self.module.random, "choice", side_effect=lambda rows: rows[0]
+        ) as choose:
+            await self.service.get_today()
+        self.assertEqual(len(choose.call_args.args[0]), 2)
+        self.assertEqual(self.plugin._fetch_recommendation_page.await_count, 2)
+
+    async def test_next_page_failure_does_not_select_from_incomplete_range(self):
+        self.service.top_n = 100
+        self.plugin._fetch_recommendation_page.side_effect = [
+            _FakePage([("1", "a", [])], page_count=2),
+            RuntimeError("page 2 offline"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "page 2"):
+            await self.service.get_today()
+        self.assertEqual(self.storage, {})
+
+    async def test_top_n_is_positive_integer_and_legacy_strings_still_work(self):
+        for value in (0, -1, 2.5, True, "", "bad"):
+            with self.subTest(value=value):
+                plugin = self.make_plugin(
+                    {**self.config, "recommendation": {"top_n": value}}
+                )
+                self.assertEqual(plugin.recommendation.top_n, 10)
+        for value in (1, 50, "100", 10000):
+            with self.subTest(value=value):
+                plugin = self.make_plugin(
+                    {**self.config, "recommendation": {"top_n": value}}
+                )
+                self.assertEqual(plugin.recommendation.top_n, int(value))
+
+    async def test_sort_config_is_used_and_saved_until_reset(self):
+        plugin = self.make_plugin(
+            {**self.config, "recommendation": {"order_by": "Most Viewed"}}
+        )
+        state, cover = await plugin.recommendation.get_today()
+        plugin._fetch_recommendation_page.assert_awaited_once_with(1, "mv")
+        self.assertEqual(state.source_order, "mv")
+        changed = self.make_plugin(
+            {**self.config, "recommendation": {"order_by": "Most Recent"}}
+        )
+        retained, _ = await changed.recommendation.get_today()
+        self.assertIn(
+            "Most Viewed",
+            changed.recommendation.message(retained, cover).chain[-1].text,
+        )
+        changed._fetch_recommendation_page.assert_not_awaited()
+        await changed.recommendation.reset_today()
+        updated, _ = await changed.recommendation.get_today()
+        self.assertEqual(updated.source_order, "mr")
+        changed._fetch_recommendation_page.assert_awaited_once_with(1, "mr")
+
+    async def test_real_category_adapter_uses_all_time_and_requested_order(self):
+        client = mock.AsyncMock()
+        manager = mock.AsyncMock()
+        manager.__aenter__.return_value = client
+        self.plugin._build_option = mock.Mock(
+            return_value=types.SimpleNamespace(
+                new_jm_async_client=mock.Mock(return_value=manager)
+            )
+        )
+        fake_jm = types.SimpleNamespace(
+            JmMagicConstants=types.SimpleNamespace(
+                TIME_ALL="a", CATEGORY_ALL="0", ORDER_BY_LATEST="mr", ORDER_BY_VIEW="mv"
+            )
+        )
+        with mock.patch.dict("sys.modules", {"jmcomic": fake_jm}):
+            for order in ("mr", "mv"):
+                await self.main.JMComicPlugin._fetch_recommendation_page(
+                    self.plugin, 2, order
+                )
+                client.categories_filter.assert_awaited_with(
+                    page=2, time="a", category="0", order_by=order
+                )
+
+    async def test_reset_clears_pick_delivery_records_and_cache_without_sending(self):
+        self.configure_targets()
+        with mock.patch.object(
+            self.module.random, "choice", side_effect=lambda rows: rows[0]
+        ):
+            await self.service.push_today()
+        image_path = next(self.service.cache_dir.glob("*.jpg"))
+        unrelated = self.service.cache_dir / "keep.txt"
+        unrelated.write_text("keep")
+        sends_before = self.plugin.context.send_message.await_count
+        await self.service.reset_today()
+        self.assertEqual(self.saved(), {})
+        self.assertIsNone(self.service.state)
+        self.assertFalse(image_path.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertEqual(self.plugin.context.send_message.await_count, sends_before)
+        restarted = self.make_plugin()
+        with mock.patch.object(
+            self.module.random, "choice", side_effect=lambda rows: rows[-1]
+        ):
+            fresh, _ = await restarted.recommendation.get_today()
+        self.assertEqual(fresh.album_id, "10")
+        self.assertEqual(fresh.attempted_targets, [])
+        self.assertEqual(fresh.sent_targets, [])
+
+    async def test_reset_waits_for_inflight_push_before_clearing_records(self):
+        self.service.targets = ["bot:FriendMessage:456"]
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def send(*_):
+            started.set()
+            await release.wait()
+            return True
+
+        self.plugin.context.send_message.side_effect = send
+        push = asyncio.create_task(self.service.push_today())
+        await started.wait()
+        reset = asyncio.create_task(self.service.reset_today())
+        await asyncio.sleep(0)
+        self.assertFalse(reset.done())
+        release.set()
+        await asyncio.gather(push, reset)
+        self.assertEqual(self.saved(), {})
+        self.assertIsNone(self.service.state)
+
+    async def test_failed_reset_does_not_clear_memory_or_cover(self):
+        state, _ = await self.service.get_today()
+        self.plugin.put_kv_data.side_effect = RuntimeError("reset storage failed")
+        with self.assertRaisesRegex(RuntimeError, "storage"):
+            await self.service.reset_today()
+        self.assertEqual(self.service.state.album_id, state.album_id)
+        self.assertEqual(len(list(self.service.cache_dir.glob("*.jpg"))), 1)
+
+    async def test_reset_command_requires_admin_and_allowed_session(self):
+        self.service.reset_today = mock.AsyncMock()
+        event = _Event()
+        result = [reply async for reply in self.plugin.reset_recommendation(event)]
+        self.assertIn("管理员", result[0].text)
+        self.service.reset_today.assert_not_awaited()
+        event.role = "admin"
+        event._group_id = "999"
+        result = [reply async for reply in self.plugin.reset_recommendation(event)]
+        self.assertIn("白名单", result[0].text)
+        self.service.reset_today.assert_not_awaited()
+        event._group_id = None
+        result = [reply async for reply in self.plugin.reset_recommendation(event)]
+        self.service.reset_today.assert_awaited_once()
+        self.assertIn("不会立即群发", result[0].text)
+        self.plugin.context.send_message.assert_not_awaited()
+
+    async def test_legacy_day_pick_does_not_get_mislabeled_as_all_time(self):
+        await self.service.get_today()
+        self.saved().pop("source_order")
+        restarted = self.make_plugin()
+        state, cover = await restarted.recommendation.get_today()
+        self.assertEqual(state.source_order, "day")
+        self.assertIn("旧版本缓存", self.service.message(state, cover).chain[-1].text)
+        restarted._fetch_recommendation_page.assert_not_awaited()
+
     async def test_invalid_rank_id_cannot_become_cache_path(self):
-        self.plugin._fetch_ranking_page.return_value = _FakePage(
+        self.plugin._fetch_recommendation_page.return_value = _FakePage(
             [("../escape", "坏数据", [])]
         )
         with self.assertRaisesRegex(ValueError, "无效"):
@@ -119,7 +304,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_calls_share_one_selection_detail_and_cover(self):
         results = await asyncio.gather(*(self.service.get_today() for _ in range(6)))
         self.assertEqual(len({state.album_id for state, _ in results}), 1)
-        self.plugin._fetch_ranking_page.assert_awaited_once()
+        self.plugin._fetch_recommendation_page.assert_awaited_once()
         self.service._fetch_detail.assert_awaited_once()
         self.service._fetch_cover.assert_awaited_once()
         self.assertTrue(all(cover == self.cover for _, cover in results))
@@ -130,7 +315,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         restored, image = await restarted.recommendation.get_today()
         self.assertEqual(restored, original)
         self.assertEqual(image, self.cover)
-        restarted._fetch_ranking_page.assert_not_awaited()
+        restarted._fetch_recommendation_page.assert_not_awaited()
         restarted.recommendation._fetch_detail.assert_not_awaited()
         restarted.recommendation._fetch_cover.assert_not_awaited()
 
@@ -142,7 +327,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         self.clock += timedelta(days=1)
         state, _ = await self.service.get_today()
         self.assertEqual(state.day, "2026-09-12")
-        self.assertEqual(self.plugin._fetch_ranking_page.await_count, 2)
+        self.assertEqual(self.plugin._fetch_recommendation_page.await_count, 2)
         self.assertTrue(all(not p.exists() for p in old))
         self.assertTrue(unrelated.exists())
 
@@ -155,7 +340,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         self.service._fetch_detail.side_effect = fetch
         state, _ = await self.service.get_today()
         self.assertEqual(state.day, "2026-09-12")
-        self.assertEqual(self.plugin._fetch_ranking_page.await_count, 2)
+        self.assertEqual(self.plugin._fetch_recommendation_page.await_count, 2)
 
     async def test_detail_failure_retries_same_id_even_after_restart(self):
         self.service._fetch_detail.side_effect = RuntimeError("detail offline")
@@ -166,14 +351,14 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         restarted = self.make_plugin()
         state, _ = await restarted.recommendation.get_today()
         self.assertEqual(state.album_id, chosen)
-        restarted._fetch_ranking_page.assert_not_awaited()
+        restarted._fetch_recommendation_page.assert_not_awaited()
         restarted.recommendation._fetch_detail.assert_awaited_once_with(chosen)
 
     async def test_storage_read_failure_does_not_overwrite_existing_pick(self):
         self.plugin.get_kv_data.side_effect = RuntimeError("storage unavailable")
         with self.assertRaisesRegex(RuntimeError, "storage"):
             await self.service.get_today()
-        self.plugin._fetch_ranking_page.assert_not_awaited()
+        self.plugin._fetch_recommendation_page.assert_not_awaited()
         self.plugin.put_kv_data.assert_not_awaited()
 
     async def test_storage_write_failure_prevents_publishing_unpersisted_pick(self):
@@ -199,7 +384,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.put_kv_data.side_effect = save
         state, _ = await self.service.get_today()
         self.assertEqual(state.album_id, chosen_id)
-        self.plugin._fetch_ranking_page.assert_awaited_once()
+        self.plugin._fetch_recommendation_page.assert_awaited_once()
 
     async def test_cover_failure_falls_back_to_text_with_all_tags(self):
         self.service._fetch_cover.side_effect = RuntimeError("cover offline")
@@ -251,10 +436,12 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
             replies = [reply async for reply in self.plugin.recommend(event)]
             self.assertEqual(len(replies), 1)
             self.assertIn("白名单", replies[0].text)
-        self.plugin._fetch_ranking_page.assert_not_awaited()
+        self.plugin._fetch_recommendation_page.assert_not_awaited()
 
     async def test_manual_error_returns_reason(self):
-        self.plugin._fetch_ranking_page.side_effect = RuntimeError("rank offline")
+        self.plugin._fetch_recommendation_page.side_effect = RuntimeError(
+            "rank offline"
+        )
         replies = [reply async for reply in self.plugin.recommend(_Event())]
         self.assertIn("rank offline", replies[0].text)
 
@@ -273,7 +460,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         manual, _ = await asyncio.gather(
             self.service.get_today(), self.service.push_today()
         )
-        self.plugin._fetch_ranking_page.assert_awaited_once()
+        self.plugin._fetch_recommendation_page.assert_awaited_once()
         calls = self.plugin.context.send_message.await_args_list
         self.assertEqual([call.args[0] for call in calls], self.service.targets)
         self.assertTrue(
@@ -290,7 +477,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         self.service.targets = ["bot:GroupMessage:999", "bot:FriendMessage:999"]
         self.plugin.private_whitelist = {"456"}
         await self.service.push_today()
-        self.plugin._fetch_ranking_page.assert_not_awaited()
+        self.plugin._fetch_recommendation_page.assert_not_awaited()
         self.plugin.context.send_message.assert_not_awaited()
 
     async def test_single_target_failure_and_false_do_not_block_other_targets(self):
@@ -341,7 +528,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
     async def test_push_with_stale_scheduled_date_is_skipped(self):
         self.configure_targets()
         await self.service.push_today(expected_day="2026-09-10")
-        self.plugin._fetch_ranking_page.assert_not_awaited()
+        self.plugin._fetch_recommendation_page.assert_not_awaited()
 
     async def test_target_normalization_deduplicates_group_session_prefixes(self):
         plugin = self.make_plugin(
@@ -487,7 +674,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         }
         with self.assertRaises(ValueError):
             await self.service.get_today()
-        self.plugin._fetch_ranking_page.assert_not_awaited()
+        self.plugin._fetch_recommendation_page.assert_not_awaited()
         self.plugin.put_kv_data.assert_not_awaited()
 
 

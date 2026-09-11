@@ -45,12 +45,18 @@
         "default": "Asia/Shanghai",
         "hint": "IANA 时区名称；同时用于判定每日推荐的日期。"
       },
-      "top_n": {
-        "description": "日榜候选数量",
+      "order_by": {
+        "description": "推荐排序（全部时间）",
         "type": "string",
-        "default": "10",
-        "options": ["3", "10"],
-        "hint": "从全部分类日榜前 3 或前 10 名随机选一本；同一天结果共享，修改后次日采用新数量。"
+        "default": "Most Recent",
+        "options": ["Most Recent", "Most Viewed"],
+        "hint": "Most Recent 按最新发布排序，Most Viewed 按最多观看排序，均为全部分类、全部时间。修改后重载插件，次日或重置推荐后生效。"
+      },
+      "top_n": {
+        "description": "随机选择范围（前 N 个）",
+        "type": "int",
+        "default": 10,
+        "hint": "填写正整数，例如 3、10、50、100；候选超过一页时自动翻页获取，实际不足 N 个时从已有结果随机选择。同一天结果共享，修改后需重载插件，次日或重置推荐后采用新数量。"
       },
       "targets": {
         "description": "推荐接收会话",

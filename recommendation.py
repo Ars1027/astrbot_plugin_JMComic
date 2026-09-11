@@ -17,6 +17,11 @@ import astrbot.api.message_components as Comp
 
 
 KV_RECOMMENDATION_KEY = "jmcomic_daily_recommendation"
+ORDER_LABELS = {
+    "mr": "全部时间 · Most Recent（最新发布）",
+    "mv": "全部时间 · Most Viewed（最多观看）",
+    "day": "日榜（旧版本缓存，可用 /jm重置推荐 更新）",
+}
 
 
 @dataclass
@@ -28,6 +33,7 @@ class DailyPick:
     details_loaded: bool = False
     attempted_targets: list[str] = field(default_factory=list)
     sent_targets: list[str] = field(default_factory=list)
+    source_order: str = "mr"
 
     @classmethod
     def restore(cls, raw):
@@ -52,11 +58,15 @@ class DailyPick:
         title = raw.get("title", "")
         if not isinstance(title, str):
             raise ValueError("每日推荐快照的标题无效")
+        source_order = raw.get("source_order", "day")
+        if source_order not in ORDER_LABELS:
+            raise ValueError("每日推荐快照的来源无效")
         return cls(
             day,
             album_id,
             title,
             details_loaded=bool(raw.get("details_loaded")),
+            source_order=source_order,
             **fields,
         )
 
@@ -84,14 +94,22 @@ class DailyRecommendation:
             self.config_error = "recommendation.timezone 无效或缺少 tzdata；定时推送已停用，手动推荐按 UTC+8 计日"
             self.enabled = False
         try:
-            self.top_n = int(plugin._cfg("recommendation", "top_n", 10))
-            if self.top_n not in (3, 10):
+            raw_top_n = str(plugin._cfg("recommendation", "top_n", 10)).strip()
+            if not re.fullmatch(r"[0-9]+", raw_top_n):
+                raise ValueError
+            self.top_n = int(raw_top_n)
+            if self.top_n < 1:
                 raise ValueError
         except (TypeError, ValueError):
             self.top_n = 10
-            logger.warning("recommendation.top_n 仅支持 3 或 10，已回退为 10")
+            logger.warning("recommendation.top_n 必须是正整数，已回退为 10")
         if self.config_error:
             logger.warning(self.config_error)
+
+        order_label = str(plugin._cfg("recommendation", "order_by", "Most Recent"))
+        if order_label not in {"Most Recent", "Most Viewed"}:
+            logger.warning("recommendation.order_by 无效，已回退为 Most Recent")
+        self.order_by = "mv" if order_label == "Most Viewed" else "mr"
 
         self.targets = []
         for target in plugin._normalize_list(
@@ -246,6 +264,61 @@ class DailyRecommendation:
             logger.warning(f"每日推荐 JM{state.album_id} 封面暂不可用: {exc}")
             return None
 
+    async def _fetch_candidates(self):
+        candidates = []
+        seen_ids = set()
+        page_number = 1
+        while len(candidates) < self.top_n:
+            page = await self.plugin._fetch_recommendation_page(
+                page_number, self.order_by
+            )
+            items = self.plugin._extract_page_results(page)
+            previous_count = len(candidates)
+            for item in items:
+                if not re.fullmatch(r"[0-9]+", item.album_id):
+                    raise ValueError("推荐列表返回了无效的作品 ID")
+                if item.album_id in seen_ids:
+                    continue
+                seen_ids.add(item.album_id)
+                candidates.append(item)
+                if len(candidates) == self.top_n:
+                    break
+            # Stop at an empty/repeated page even if the upstream total is stale.
+            if len(candidates) == previous_count:
+                break
+            page_count = self.plugin._page_count(page)
+            if page_count is not None and page_number >= page_count:
+                break
+            page_number += 1
+        return candidates
+
+    async def reset_today(self):
+        # Use the same lock order as push_today. Finish an in-flight delivery before
+        # clearing its records so an old batch cannot mark the new pick as sent.
+        async with self._push_lock:
+            async with self._lock:
+                try:
+                    await self.plugin.put_kv_data(KV_RECOMMENDATION_KEY, {})
+                except BaseException:
+                    self._loaded = False
+                    raise
+                self.state = None
+                self._loaded = True
+                day = self.now().date().isoformat()
+                try:
+                    if self.cache_dir.exists():
+                        for path in self.cache_dir.iterdir():
+                            if (
+                                re.fullmatch(
+                                    re.escape(day) + r"-[0-9]+\.jpg(?:\.tmp)?",
+                                    path.name,
+                                )
+                                and path.is_file()
+                            ):
+                                path.unlink()
+                except OSError as exc:
+                    logger.warning(f"每日推荐已重置，但封面缓存清理失败: {exc}")
+
     async def get_today(self) -> tuple[DailyPick, bytes | None]:
         async with self._lock:
             await self._load()
@@ -254,15 +327,14 @@ class DailyRecommendation:
                 day = self.now().date().isoformat()
                 self._purge_covers(day)
                 if self.state is None or self.state.day != day:
-                    page = await self.plugin._fetch_ranking_page("day", "0", 1)
-                    candidates = self.plugin._extract_page_results(page)[: self.top_n]
+                    candidates = await self._fetch_candidates()
                     if not candidates:
-                        raise ValueError("今日日榜暂无可推荐的作品")
+                        raise ValueError("当前推荐列表暂无可推荐的作品")
                     chosen = random.choice(candidates)
-                    if not re.fullmatch(r"[0-9]+", chosen.album_id):
-                        raise ValueError("日榜返回了无效的作品 ID")
                     # Persist ID before fetching details so retries cannot select another book.
-                    await self._save(DailyPick(day, chosen.album_id))
+                    await self._save(
+                        DailyPick(day, chosen.album_id, source_order=self.order_by)
+                    )
                 state = copy.deepcopy(self.state)
                 if not state.details_loaded:
                     album = await self._fetch_detail(state.album_id)
@@ -281,6 +353,7 @@ class DailyRecommendation:
     def message(state: DailyPick, cover: bytes | None) -> MessageChain:
         text = (
             f"JMComic 每日推荐 · {state.day}\n"
+            f"来源: {ORDER_LABELS[state.source_order]}\n"
             f"标题: {state.title}\n"
             f"ID: JM{state.album_id}\n"
             f"标签: {'、'.join(state.tags) if state.tags else '暂无标签'}\n"
