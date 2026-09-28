@@ -125,6 +125,12 @@
         "default": true,
         "hint": "API 搜索结果可能不带标签；开启后会为当前展示的结果拉取详情补全标签。"
       },
+      "auto_recognize_jm": {
+        "description": "自动识别消息中的 JM 号",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，普通消息中的第一个 JM 加可选空格和数字会自动查询；不区分大小写。命令消息和机器人自己发送的消息会跳过。修改后需重载插件。"
+      },
       "search_enrich_tag_concurrency": {
         "description": "标签补全并发数",
         "type": "int",
