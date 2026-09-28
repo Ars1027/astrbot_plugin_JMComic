@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import io
 import random
 import re
 from dataclasses import asdict, dataclass, field
@@ -13,7 +12,21 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
-import astrbot.api.message_components as Comp
+
+if __package__:
+    from .album_card import (
+        album_message,
+        fetch_album_cover,
+        fetch_album_detail,
+        validate_cover,
+    )
+else:
+    from album_card import (
+        album_message,
+        fetch_album_cover,
+        fetch_album_detail,
+        validate_cover,
+    )
 
 
 KV_RECOMMENDATION_KEY = "jmcomic_daily_recommendation"
@@ -220,27 +233,14 @@ class DailyRecommendation:
                     path.unlink()
 
     async def _fetch_detail(self, album_id: str):
-        option = self.plugin._build_option(self.plugin.data_dir / "query-cache")
-        async with option.new_jm_async_client(max_clients=3) as client:
-            return await client.get_album_detail(album_id)
+        return await fetch_album_detail(self.plugin, album_id)
 
     async def _fetch_cover(self, album_id: str) -> bytes:
-        import jmcomic
-
-        option = self.plugin._build_option(self.cache_dir)
-        async with option.new_jm_async_client(max_clients=1) as client:
-            url = jmcomic.JmcomicText.get_album_cover_url(album_id)
-            response = await client.get_jm_image(url)
-            return bytes(response.content)
+        return await fetch_album_cover(self.plugin, album_id, self.cache_dir)
 
     @staticmethod
     def _validate_cover(content: bytes):
-        from PIL import Image
-
-        if not content or len(content) > 10 * 1024 * 1024:
-            raise ValueError("封面为空或超过 10 MB")
-        with Image.open(io.BytesIO(content)) as image:
-            image.verify()
+        validate_cover(content)
 
     async def _cover(self, state: DailyPick) -> bytes | None:
         path = self.cache_dir / f"{state.day}-{state.album_id}.jpg"
@@ -351,21 +351,11 @@ class DailyRecommendation:
 
     @staticmethod
     def message(state: DailyPick, cover: bytes | None) -> MessageChain:
-        text = (
+        prefix = (
             f"JMComic 每日推荐 · {state.day}\n"
             f"来源: {ORDER_LABELS[state.source_order]}\n"
-            f"标题: {state.title}\n"
-            f"ID: JM{state.album_id}\n"
-            f"标签: {'、'.join(state.tags) if state.tags else '暂无标签'}\n"
-            f"下载: /jm下载 {state.album_id}"
         )
-        components = []
-        if cover is not None:
-            components.append(Comp.Image.fromBytes(cover))
-        else:
-            text += "\n封面暂不可用"
-        components.append(Comp.Plain(text=text))
-        return MessageChain(chain=components)
+        return album_message(state.album_id, state.title, state.tags, cover, prefix)
 
     def _target_allowed(self, target: str) -> bool:
         _platform, kind, session_id = target.split(":", 2)

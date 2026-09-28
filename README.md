@@ -7,7 +7,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-ff69b4?style=for-the-badge)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg?style=for-the-badge&color=76bad9)](https://www.python.org/)
 
-_✨ JMComic 的 AstrBot 查询与异步下载插件。v0.3.1 支持可配置排序的每日封面推荐与定时推送、搜索、分类热门榜、详情查询、按 ID 下载，以及 ZIP/PDF 群文件发送。✨_
+_✨ JMComic 的 AstrBot 查询与异步下载插件。v0.4.0 支持 JM 号识别、可配置排序的每日封面推荐与定时推送、搜索、分类热门榜、详情查询、按 ID 下载，以及 ZIP/PDF 群文件发送。✨_
 
 </div>
 
@@ -16,7 +16,8 @@ _✨ JMComic 的 AstrBot 查询与异步下载插件。v0.3.1 支持可配置排
 - `/jm搜索 <关键词> [页码]`：搜索 JMComic 条目。
 - `/jm热门 [日|周|月] [分类] [页码]`：查看分类热门榜，别名 `/jm排行`。
 - `更多` 或 `/jm更多`：继续显示最近一次搜索或热门榜结果。
-- `/jm详情 <id>`：查看本子元数据和章节列表。
+- `/jm详情 <id>`：查看封面、标题、JM ID 和完整标签，并附带下载指令；别名 `/jminfo`。
+- `/jm识别 <JM号或纯数字>`：查询并发送同样的封面卡片，别名 `/jmlookup`。
 - `/jm推荐`：获取今日统一推荐，包含封面、标题、JM ID、完整标签及下载指令，别名 `/jmrecommend`。
 - `/jm重置推荐`：AstrBot 管理员清空今日共享推荐及推送记录，下一次查询重新抽取，不立即群发；别名 `/jmresetrecommend`。
 - `/jm下载 <id> [zip|pdf]`：创建异步下载任务，完成后上传 ZIP/PDF 到群文件。
@@ -41,6 +42,7 @@ _✨ JMComic 的 AstrBot 查询与异步下载插件。v0.3.1 支持可配置排
 - `query.search_page_size`：每次展示的搜索/热门榜结果数量，默认 10。
 - `query.search_result_tag_limit`：多结果标签展示数量，默认 5；单结果显示全部标签。
 - `query.search_enrich_tags`：自动获取详情补全 API 搜索标签，默认开启。
+- `query.auto_recognize_jm`：自动识别普通消息中的 JM 号，默认开启；修改后需重载插件。
 - `download.default_export_format`：默认导出格式，支持 `zip` / `pdf`。
 - `download.file_delivery_mode`：支持 `auto`、`napcat_http_stream`、`onebot_group_file_base64`。
 - `download.max_base64_file_mb`：`auto` 模式切换 HTTP Stream 的阈值，默认 80 MB。
@@ -82,6 +84,12 @@ _✨ JMComic 的 AstrBot 查询与异步下载插件。v0.3.1 支持可配置排
 每个接收会话在每轮每日选择中最多自动尝试发送一次（管理员重置后清除记录），手动 `/jm推荐` 不占用定时推送次数。发送尝试和成功记录均会持久化；失败、超时或结果不明确的发送不自动重试，避免重复推送，单个会话失败不影响其余会话。必要时可手动获取推荐。关闭插件时定时任务随之取消。
 
 升级时需安装新增依赖 `tzdata`（尤其是 Windows 环境），正常重新安装插件依赖即可。功能沿用 `jmcomic>=2.7.0` 的接口。
+
+## JM 号识别
+
+`/jm识别 <JM号或纯数字>`（别名 `/jmlookup`）和 `/jm详情 <id>`（别名 `/jminfo`）都会返回封面、标题、JM ID、完整标签和下载指令。一次性查询不会改变每日推荐状态。
+
+开启 `query.auto_recognize_jm` 后，普通消息中出现的第一个 `JM` 加可选空格和数字会自动触发同一张卡片；匹配不区分大小写。命令消息、机器人自己发送的消息和未通过现有访问控制的消息会跳过，自动识别不发送前置提示。自动查询失败只记录日志，不向会话发送错误；封面获取失败时仍发送文字卡片，并注明“封面暂不可用”。修改开关后需重载插件。此开关只控制普通消息的自动识别，显式 `/jm识别`、`/jmlookup`、`/jm详情` 和 `/jminfo` 命令仍可使用。
 
 ## NapCat HTTP Stream
 

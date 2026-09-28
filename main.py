@@ -16,12 +16,25 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 if __package__:
+    from .album_card import (
+        album_message,
+        fetch_album_cover,
+        fetch_album_detail,
+        validate_cover,
+    )
     from .recommendation import DailyRecommendation
 else:
+    from album_card import (
+        album_message,
+        fetch_album_cover,
+        fetch_album_detail,
+        validate_cover,
+    )
     from recommendation import DailyRecommendation
 
 
 PLUGIN_NAME = "astrbot_plugin_JMComic"
+JM_ID_PATTERN = r"(?i)(?<![a-z0-9_])jm\s*([0-9]+)(?![a-z0-9_])"
 KV_TASKS_KEY = "jmcomic_tasks"
 ACTIVE_STATUSES = {"pending", "running"}
 SUPPORTED_FORMATS = {"zip", "pdf"}
@@ -201,7 +214,7 @@ class NapCatHttpDeliveryError(RuntimeError):
     PLUGIN_NAME,
     "Ars1027",
     "JMComic 的 AstrBot 查询与异步下载插件",
-    "v0.3.1",
+    "v0.4.0",
 )
 class JMComicPlugin(Star):
     def _cfg(self, block: str, key: str, default):
@@ -298,6 +311,7 @@ class JMComicPlugin(Star):
         self.search_page_size = max(
             1, int(self._cfg("query", "search_page_size", 10) or 10)
         )
+        self.auto_recognize_jm = bool(self._cfg("query", "auto_recognize_jm", True))
         search_result_tag_limit = self._cfg("query", "search_result_tag_limit", 5)
         self.search_result_tag_limit = max(
             0,
@@ -1383,12 +1397,14 @@ class JMComicPlugin(Star):
             "/jm热门 [日|周|月] [分类] [页码]\n"
             "/jm更多 或直接发送“更多”\n"
             "/jm详情 <id>\n"
+            "/jm识别 <JM号或纯数字>（封面、标题、完整标签）\n"
             "/jm推荐（查看今日统一推荐，含封面与标签）\n"
             "/jm重置推荐（管理员：清空今日推荐和推送记录，不立即群发）\n"
             "/jm下载 <id> [zip|pdf]\n"
             "/jm任务\n"
             "/jm取消 <task_id>\n\n"
             f"热门榜分类: {SUPPORTED_CATEGORY_HINT}\n"
+            "普通消息中的 JM123456 或 JM 123456 会自动返回卡片，每条只取第一个；可在配置中关闭。\n"
             "默认仅私聊可用；群聊需在插件配置中加入白名单。"
         )
 
@@ -1547,13 +1563,69 @@ class JMComicPlugin(Star):
             return
 
         try:
-            option = self._build_option(self.data_dir / "query-cache")
-            async with option.new_jm_async_client(max_clients=3) as client:
-                album = await client.get_album_detail(album_id)
-            yield event.plain_result(self._format_album_detail(album))
+            yield event.chain_result((await self._album_card(album_id)).chain)
         except Exception as exc:
             logger.warning(f"JMComic 详情查询失败: {exc}")
             yield event.plain_result(f"详情查询失败: {exc}")
+
+    async def _album_card(self, album_id: str) -> MessageChain:
+        album = await fetch_album_detail(self, album_id)
+        title = str(getattr(album, "name", "") or "").strip()
+        if not title:
+            raise ValueError("作品详情缺少标题，请稍后重试")
+        tags = self._normalize_tags(getattr(album, "tags", []))
+        cover = None
+        try:
+            content = await asyncio.wait_for(
+                fetch_album_cover(self, album_id), timeout=60
+            )
+            await asyncio.to_thread(validate_cover, content)
+            cover = content
+        except Exception as exc:
+            logger.warning(f"JMComic JM{album_id} 封面暂不可用: {exc}")
+        return album_message(album_id, title, tags, cover)
+
+    @filter.command("jm识别", alias={"jmlookup"})
+    async def identify(self, event: AstrMessageEvent):
+        allowed, reason = self._is_allowed(event)
+        event.stop_event()
+        if not allowed:
+            yield event.plain_result(reason)
+            return
+        argument = self._strip_command(event, "jm识别", "jmlookup")
+        match = re.fullmatch(r"(?:jm\s*)?([0-9]+)", argument.strip(), re.IGNORECASE)
+        if not match:
+            yield event.plain_result("用法: /jm识别 <JM号或纯数字>")
+            return
+        try:
+            yield event.chain_result((await self._album_card(match.group(1))).chain)
+        except Exception as exc:
+            logger.warning(f"JMComic 识别查询失败: {exc}")
+            yield event.plain_result(f"详情查询失败: {exc}")
+
+    @filter.regex(JM_ID_PATTERN, priority=-10)
+    async def on_jm_message(self, event: AstrMessageEvent):
+        if not self.auto_recognize_jm:
+            return
+        message = (event.message_str or "").strip()
+        message_obj = getattr(event, "message_obj", None)
+        original = str(getattr(message_obj, "message_str", "") or "").strip()
+        if message.startswith("/") or original.startswith("/"):
+            return
+        if event.get_extra("handlers_parsed_params", {}):
+            return
+        self_id = getattr(message_obj, "self_id", None)
+        if self_id is not None and str(self_id) == self._sender_id(event):
+            return
+        match = re.search(JM_ID_PATTERN, message)
+        if not match or not self._is_allowed(event)[0]:
+            return
+        event.stop_event()
+        album_id = match.group(1)
+        try:
+            yield event.chain_result((await self._album_card(album_id)).chain)
+        except Exception as exc:
+            logger.warning(f"JMComic 自动查询 JM{album_id} 失败: {exc}")
 
     @filter.command("jm下载", alias={"jmdl"})
     async def download(self, event: AstrMessageEvent):

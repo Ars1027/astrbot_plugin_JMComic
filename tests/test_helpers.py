@@ -39,6 +39,10 @@ class _Filter:
     def event_message_type(*_args, **_kwargs):
         return lambda func: func
 
+    @staticmethod
+    def regex(*_args, **_kwargs):
+        return lambda func: func
+
 
 class _Star:
     def __init__(self, context):
