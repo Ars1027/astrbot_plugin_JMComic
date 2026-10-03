@@ -84,6 +84,188 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
     def saved(self):
         return self.storage[self.module.KV_RECOMMENDATION_KEY]
 
+    async def test_default_is_weekly_most_viewed_with_hanman_excluded(self):
+        state, cover = await self.service.get_today()
+        self.plugin._fetch_recommendation_page.assert_awaited_once_with(1, "mv", "week")
+        self.assertEqual(state.source_period, "week")
+        self.assertEqual(state.source_excluded_tags, ["韩漫"])
+        text = self.service.message(state, cover).chain[-1].text
+        self.assertIn("周榜", text)
+        self.assertIn("Most Viewed", text)
+        self.assertIn("已排除标签: 韩漫", text)
+
+    async def test_filter_uses_details_and_refills_after_fully_excluded_page(self):
+        self.service.top_n = 2
+        self.plugin._fetch_recommendation_page.side_effect = [
+            _FakePage([("1", "a", ["韓漫"]), ("2", "b", ["韩漫"])], page_count=3),
+            _FakePage([("3", "c", []), ("4", "d", ["剧情"])], page=2, page_count=3),
+            _FakePage([("4", "d", []), ("5", "e", [])], page=3, page_count=3),
+        ]
+        self.service._fetch_detail.side_effect = lambda album_id: types.SimpleNamespace(
+            name=f"详情{album_id}",
+            tags=["韓漫"] if album_id == "4" else ["剧情"],
+        )
+        with mock.patch.object(
+            self.module.random, "choice", side_effect=lambda rows: rows[-1]
+        ) as choose:
+            state, _ = await self.service.get_today()
+        self.assertEqual([row.album_id for row in choose.call_args.args[0]], ["3", "5"])
+        self.assertEqual(state.album_id, "5")
+        self.assertEqual(state.title, "详情5")
+        self.assertEqual(state.tags, ["剧情"])
+        self.assertEqual(
+            self.service._fetch_detail.await_args_list,
+            [mock.call("3"), mock.call("4"), mock.call("5")],
+        )
+        self.assertEqual(self.plugin._fetch_recommendation_page.await_count, 3)
+
+    async def test_repeated_excluded_page_stops_and_push_sends_nothing(self):
+        self.plugin._fetch_recommendation_page.return_value = _FakePage(
+            [("1", "a", [])], page_count=None
+        )
+        self.service._fetch_detail.side_effect = lambda _: types.SimpleNamespace(
+            name="标题", tags=["韩漫"]
+        )
+        self.service.targets = ["bot:FriendMessage:456"]
+        with self.assertRaisesRegex(ValueError, "暂无"):
+            await self.service.push_today()
+        self.assertEqual(self.plugin._fetch_recommendation_page.await_count, 2)
+        self.service._fetch_detail.assert_awaited_once_with("1")
+        self.assertEqual(self.storage, {})
+        self.service._fetch_cover.assert_not_awaited()
+        self.plugin.context.send_message.assert_not_awaited()
+
+    async def test_hanman_category_is_excluded_when_detail_tags_are_empty(self):
+        page = _FakePage([("1", "a", []), ("2", "b", []), ("3", "c", [])])
+        page.content = [
+            ("1", {"name": "a", "category": {"id": "5", "title": "韓漫"}}),
+            ("2", {"name": "b", "category_sub": {"id": "hanman"}}),
+            ("3", {"name": "c", "category": {"id": "1", "title": "同人"}}),
+        ]
+        self.plugin._fetch_recommendation_page.return_value = page
+        self.service._fetch_detail.side_effect = lambda _: types.SimpleNamespace(
+            name="详情", tags=[]
+        )
+        state, _ = await self.service.get_today()
+        self.assertEqual(state.album_id, "3")
+        self.assertEqual(state.tags, [])
+        self.service._fetch_detail.assert_awaited_once_with("3")
+
+    async def test_custom_exclusion_is_exact_and_empty_list_disables_filter(self):
+        plugin = self.make_plugin(
+            {**self.config, "recommendation": {"exclude_tags": [" TAG ", "韓漫"]}}
+        )
+        plugin._fetch_recommendation_page.return_value = _FakePage(
+            [("1", "a", ["tag"]), ("2", "b", ["韩漫"]), ("3", "c", [])]
+        )
+        plugin.recommendation._fetch_detail.side_effect = lambda _: (
+            types.SimpleNamespace(name="标题中有韩漫", tags=["tag-extra", "韩漫风格"])
+        )
+        state, _ = await plugin.recommendation.get_today()
+        self.assertEqual(state.album_id, "3")
+        self.storage.clear()
+        unfiltered = self.make_plugin(
+            {**self.config, "recommendation": {"exclude_tags": []}}
+        )
+        unfiltered._fetch_recommendation_page.return_value = _FakePage(
+            [("1", "a", ["韩漫"])]
+        )
+        unfiltered.recommendation._fetch_detail.side_effect = lambda _: (
+            types.SimpleNamespace(name="标题", tags=["韓漫"])
+        )
+        state, _ = await unfiltered.recommendation.get_today()
+        self.assertEqual(state.album_id, "1")
+        self.assertEqual(state.source_excluded_tags, [])
+
+    async def test_time_range_is_configurable_and_kept_until_reset(self):
+        for label, period in (
+            ("日榜", "day"),
+            ("周榜", "week"),
+            ("月榜", "month"),
+            ("全部时间", "all"),
+        ):
+            with self.subTest(label=label):
+                self.storage.clear()
+                plugin = self.make_plugin(
+                    {**self.config, "recommendation": {"time_range": label}}
+                )
+                state, _ = await plugin.recommendation.get_today()
+                plugin._fetch_recommendation_page.assert_awaited_once_with(
+                    1, "mv", period
+                )
+                self.assertEqual(state.source_period, period)
+        changed = self.make_plugin(
+            {**self.config, "recommendation": {"time_range": "日榜"}}
+        )
+        state, _ = await changed.recommendation.get_today()
+        self.assertEqual(state.source_period, "all")
+        changed._fetch_recommendation_page.assert_not_awaited()
+        await changed.recommendation.reset_today()
+        state, _ = await changed.recommendation.get_today()
+        self.assertEqual(state.source_period, "day")
+
+    async def test_old_all_time_snapshot_preserves_source_and_blocks_excluded_pick(
+        self,
+    ):
+        self.storage[self.module.KV_RECOMMENDATION_KEY] = {
+            "day": self.clock.date().isoformat(),
+            "album_id": "1",
+            "title": "旧推荐",
+            "tags": ["剧情"],
+            "details_loaded": True,
+            "source_order": "mv",
+        }
+        state, cover = await self.service.get_today()
+        self.assertEqual(state.source_period, "all")
+        self.assertEqual(state.source_excluded_tags, [])
+        self.assertIn("全部时间", self.service.message(state, cover).chain[-1].text)
+        self.plugin._fetch_recommendation_page.assert_not_awaited()
+        self.saved()["tags"] = ["韓漫"]
+        restarted = self.make_plugin()
+        with self.assertRaisesRegex(ValueError, "jm重置推荐"):
+            await restarted.recommendation.get_today()
+        restarted.recommendation._fetch_cover.assert_not_awaited()
+        restarted._fetch_recommendation_page.assert_not_awaited()
+
+    async def test_changed_exclusions_do_not_relabel_saved_pick_until_reset(self):
+        original, _ = await self.service.get_today()
+        changed = self.make_plugin(
+            {**self.config, "recommendation": {"exclude_tags": ["其他标签"]}}
+        )
+        state, cover = await changed.recommendation.get_today()
+        self.assertEqual(state, original)
+        self.assertIn(
+            "已排除标签: 韩漫",
+            changed.recommendation.message(state, cover).chain[-1].text,
+        )
+        await changed.recommendation.reset_today()
+        state, _ = await changed.recommendation.get_today()
+        self.assertEqual(state.source_excluded_tags, ["其他标签"])
+
+    async def test_invalid_sort_and_time_range_use_hot_weekly_defaults(self):
+        plugin = self.make_plugin(
+            {
+                **self.config,
+                "recommendation": {"order_by": "invalid", "time_range": "invalid"},
+            }
+        )
+        state, _ = await plugin.recommendation.get_today()
+        plugin._fetch_recommendation_page.assert_awaited_once_with(1, "mv", "week")
+        self.assertEqual(state.source_period, "week")
+        self.assertEqual(state.source_order, "mv")
+
+    async def test_candidate_detail_failure_does_not_save_unverified_pick(self):
+        async def detail(album_id):
+            if album_id != "1":
+                raise RuntimeError("detail offline")
+            return types.SimpleNamespace(name="安全候选", tags=["剧情"])
+
+        self.service._fetch_detail.side_effect = detail
+        with self.assertRaisesRegex(RuntimeError, "offline"):
+            await self.service.get_today()
+        self.assertEqual(self.storage, {})
+        self.service._fetch_cover.assert_not_awaited()
+
     async def test_candidates_accept_arbitrary_positive_n(self):
         for count in (1, 3, 7, 10, 19):
             with self.subTest(count=count):
@@ -101,7 +283,9 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
                     [str(i) for i in range(1, count + 1)],
                 )
                 self.assertEqual(state.album_id, str(count))
-                plugin._fetch_recommendation_page.assert_awaited_once_with(1, "mr")
+                plugin._fetch_recommendation_page.assert_awaited_once_with(
+                    1, "mv", "week"
+                )
 
     async def test_short_and_empty_rankings(self):
         self.plugin._fetch_recommendation_page.return_value = _FakePage([])
@@ -132,7 +316,11 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             self.plugin._fetch_recommendation_page.await_args_list,
-            [mock.call(1, "mr"), mock.call(2, "mr"), mock.call(3, "mr")],
+            [
+                mock.call(1, "mv", "week"),
+                mock.call(2, "mv", "week"),
+                mock.call(3, "mv", "week"),
+            ],
         )
 
     async def test_repeated_page_stops_without_duplicate_candidates(self):
@@ -175,7 +363,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
             {**self.config, "recommendation": {"order_by": "Most Viewed"}}
         )
         state, cover = await plugin.recommendation.get_today()
-        plugin._fetch_recommendation_page.assert_awaited_once_with(1, "mv")
+        plugin._fetch_recommendation_page.assert_awaited_once_with(1, "mv", "week")
         self.assertEqual(state.source_order, "mv")
         changed = self.make_plugin(
             {**self.config, "recommendation": {"order_by": "Most Recent"}}
@@ -189,9 +377,33 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         await changed.recommendation.reset_today()
         updated, _ = await changed.recommendation.get_today()
         self.assertEqual(updated.source_order, "mr")
-        changed._fetch_recommendation_page.assert_awaited_once_with(1, "mr")
+        self.assertEqual(updated.source_period, "all")
+        changed._fetch_recommendation_page.assert_awaited_once_with(1, "mr", "all")
 
-    async def test_real_category_adapter_uses_all_time_and_requested_order(self):
+    async def test_latest_sort_keeps_all_time_for_each_configured_range(self):
+        for label in ("日榜", "周榜", "月榜", "全部时间"):
+            with self.subTest(label=label):
+                self.storage.clear()
+                plugin = self.make_plugin(
+                    {
+                        **self.config,
+                        "recommendation": {
+                            "order_by": "Most Recent",
+                            "time_range": label,
+                        },
+                    }
+                )
+                state, cover = await plugin.recommendation.get_today()
+                plugin._fetch_recommendation_page.assert_awaited_once_with(
+                    1, "mr", "all"
+                )
+                self.assertEqual(state.source_period, "all")
+                self.assertIn(
+                    "全部时间 · Most Recent",
+                    plugin.recommendation.message(state, cover).chain[-1].text,
+                )
+
+    async def test_category_adapter_uses_requested_time_range_and_order(self):
         client = mock.AsyncMock()
         manager = mock.AsyncMock()
         manager.__aenter__.return_value = client
@@ -202,17 +414,32 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         )
         fake_jm = types.SimpleNamespace(
             JmMagicConstants=types.SimpleNamespace(
-                TIME_ALL="a", CATEGORY_ALL="0", ORDER_BY_LATEST="mr", ORDER_BY_VIEW="mv"
+                TIME_TODAY="t",
+                TIME_WEEK="w",
+                TIME_MONTH="m",
+                TIME_ALL="a",
+                CATEGORY_ALL="0",
+                ORDER_BY_LATEST="mr",
+                ORDER_BY_VIEW="mv",
             )
         )
         with mock.patch.dict("sys.modules", {"jmcomic": fake_jm}):
-            for order in ("mr", "mv"):
-                await self.main.JMComicPlugin._fetch_recommendation_page(
-                    self.plugin, 2, order
-                )
-                client.categories_filter.assert_awaited_with(
-                    page=2, time="a", category="0", order_by=order
-                )
+            for period, time_range in (
+                ("day", "t"),
+                ("week", "w"),
+                ("month", "m"),
+                ("all", "a"),
+            ):
+                for order in ("mr", "mv"):
+                    await self.main.JMComicPlugin._fetch_recommendation_page(
+                        self.plugin, 2, order, period
+                    )
+                    client.categories_filter.assert_awaited_with(
+                        page=2,
+                        time=time_range if order == "mv" else "a",
+                        category="0",
+                        order_by=order,
+                    )
 
     async def test_reset_clears_pick_delivery_records_and_cache_without_sending(self):
         self.configure_targets()
@@ -306,7 +533,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         results = await asyncio.gather(*(self.service.get_today() for _ in range(6)))
         self.assertEqual(len({state.album_id for state, _ in results}), 1)
         self.plugin._fetch_recommendation_page.assert_awaited_once()
-        self.service._fetch_detail.assert_awaited_once()
+        self.assertEqual(self.service._fetch_detail.await_count, 10)
         self.service._fetch_cover.assert_awaited_once()
         self.assertTrue(all(cover == self.cover for _, cover in results))
 
@@ -344,6 +571,10 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin._fetch_recommendation_page.await_count, 2)
 
     async def test_detail_failure_retries_same_id_even_after_restart(self):
+        self.plugin = self.make_plugin(
+            {**self.config, "recommendation": {"exclude_tags": []}}
+        )
+        self.service = self.plugin.recommendation
         self.service._fetch_detail.side_effect = RuntimeError("detail offline")
         with self.assertRaisesRegex(RuntimeError, "offline"):
             await self.service.get_today()
@@ -367,7 +598,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "disk full"):
             await self.service.get_today()
         self.assertIsNone(self.service.state)
-        self.service._fetch_detail.assert_not_awaited()
+        self.service._fetch_cover.assert_not_awaited()
 
     async def test_uncertain_storage_write_reloads_committed_choice(self):
         async def commit_then_fail(key, value):
