@@ -92,7 +92,7 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         text = self.service.message(state, cover).chain[-1].text
         self.assertIn("周榜", text)
         self.assertIn("Most Viewed", text)
-        self.assertIn("已排除标签: 韩漫", text)
+        self.assertNotIn("已排除标签", text)
 
     async def test_filter_uses_details_and_refills_after_fully_excluded_page(self):
         self.service.top_n = 2
@@ -227,15 +227,15 @@ class RecommendationTests(unittest.IsolatedAsyncioTestCase):
         restarted.recommendation._fetch_cover.assert_not_awaited()
         restarted._fetch_recommendation_page.assert_not_awaited()
 
-    async def test_changed_exclusions_do_not_relabel_saved_pick_until_reset(self):
+    async def test_changed_exclusions_keep_saved_filter_metadata_until_reset(self):
         original, _ = await self.service.get_today()
         changed = self.make_plugin(
             {**self.config, "recommendation": {"exclude_tags": ["其他标签"]}}
         )
         state, cover = await changed.recommendation.get_today()
         self.assertEqual(state, original)
-        self.assertIn(
-            "已排除标签: 韩漫",
+        self.assertNotIn(
+            "已排除标签",
             changed.recommendation.message(state, cover).chain[-1].text,
         )
         await changed.recommendation.reset_today()

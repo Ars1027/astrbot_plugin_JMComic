@@ -438,8 +438,6 @@ class DailyRecommendation:
         if state.source_order != "day":
             source = f"{PERIOD_LABELS[state.source_period]} · {source}"
         prefix = f"JMComic 每日推荐 · {state.day}\n来源: {source}\n"
-        if state.source_excluded_tags:
-            prefix += f"已排除标签: {'、'.join(state.source_excluded_tags)}\n"
         return album_message(state.album_id, state.title, state.tags, cover, prefix)
 
     def _target_allowed(self, target: str) -> bool:
