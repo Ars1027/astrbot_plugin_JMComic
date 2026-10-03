@@ -214,7 +214,7 @@ class NapCatHttpDeliveryError(RuntimeError):
     PLUGIN_NAME,
     "Ars1027",
     "JMComic 的 AstrBot 查询与异步下载插件",
-    "v0.4.0",
+    "v0.5.0",
 )
 class JMComicPlugin(Star):
     def _cfg(self, block: str, key: str, default):
@@ -821,15 +821,23 @@ class JMComicPlugin(Star):
             method = getattr(client, method_name)
             return await method(page=page, category=category)
 
-    async def _fetch_recommendation_page(self, page: int, order_by: str):
+    async def _fetch_recommendation_page(
+        self, page: int, order_by: str, period: str = "week"
+    ):
         import jmcomic
 
         constants = jmcomic.JmMagicConstants
+        time_range = {
+            "day": constants.TIME_TODAY,
+            "week": constants.TIME_WEEK,
+            "month": constants.TIME_MONTH,
+            "all": constants.TIME_ALL,
+        }[period if order_by == "mv" else "all"]
         option = self._build_option(self.data_dir / "query-cache")
         async with option.new_jm_async_client(max_clients=3) as client:
             return await client.categories_filter(
                 page=page,
-                time=constants.TIME_ALL,
+                time=time_range,
                 category=constants.CATEGORY_ALL,
                 order_by=(
                     constants.ORDER_BY_VIEW if order_by == "mv" else constants.ORDER_BY_LATEST

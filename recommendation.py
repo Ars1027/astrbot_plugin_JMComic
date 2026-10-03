@@ -6,6 +6,7 @@ import asyncio
 import copy
 import random
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -31,10 +32,11 @@ else:
 
 KV_RECOMMENDATION_KEY = "jmcomic_daily_recommendation"
 ORDER_LABELS = {
-    "mr": "全部时间 · Most Recent（最新发布）",
-    "mv": "全部时间 · Most Viewed（最多观看）",
+    "mr": "Most Recent（最新发布）",
+    "mv": "Most Viewed（最多观看）",
     "day": "日榜（旧版本缓存，可用 /jm重置推荐 更新）",
 }
+PERIOD_LABELS = {"day": "日榜", "week": "周榜", "month": "月榜", "all": "全部时间"}
 
 
 @dataclass
@@ -47,6 +49,8 @@ class DailyPick:
     attempted_targets: list[str] = field(default_factory=list)
     sent_targets: list[str] = field(default_factory=list)
     source_order: str = "mr"
+    source_period: str = "all"
+    source_excluded_tags: list[str] = field(default_factory=list)
 
     @classmethod
     def restore(cls, raw):
@@ -61,7 +65,12 @@ class DailyPick:
         ):
             raise ValueError("每日推荐快照的日期或 ID 无效")
         fields = {}
-        for key in ("tags", "attempted_targets", "sent_targets"):
+        for key in (
+            "tags",
+            "attempted_targets",
+            "sent_targets",
+            "source_excluded_tags",
+        ):
             value = raw.get(key, [])
             if not isinstance(value, list) or any(
                 not isinstance(item, str) for item in value
@@ -74,12 +83,18 @@ class DailyPick:
         source_order = raw.get("source_order", "day")
         if source_order not in ORDER_LABELS:
             raise ValueError("每日推荐快照的来源无效")
+        source_period = raw.get(
+            "source_period", "day" if source_order == "day" else "all"
+        )
+        if not isinstance(source_period, str) or source_period not in PERIOD_LABELS:
+            raise ValueError("每日推荐快照的时间范围无效")
         return cls(
             day,
             album_id,
             title,
             details_loaded=bool(raw.get("details_loaded")),
             source_order=source_order,
+            source_period=source_period,
             **fields,
         )
 
@@ -119,10 +134,29 @@ class DailyRecommendation:
         if self.config_error:
             logger.warning(self.config_error)
 
-        order_label = str(plugin._cfg("recommendation", "order_by", "Most Recent"))
+        order_label = str(plugin._cfg("recommendation", "order_by", "Most Viewed"))
         if order_label not in {"Most Recent", "Most Viewed"}:
-            logger.warning("recommendation.order_by 无效，已回退为 Most Recent")
+            logger.warning("recommendation.order_by 无效，已回退为 Most Viewed")
+            order_label = "Most Viewed"
         self.order_by = "mv" if order_label == "Most Viewed" else "mr"
+        period_label = str(plugin._cfg("recommendation", "time_range", "周榜"))
+        self.period = next(
+            (
+                period
+                for period, label in PERIOD_LABELS.items()
+                if label == period_label
+            ),
+            "week",
+        )
+        if period_label not in PERIOD_LABELS.values():
+            logger.warning("recommendation.time_range 无效，已回退为周榜")
+        # The API's time-based orders are mv_t/mv_w/mv_m; keep latest as plain mr.
+        if self.order_by == "mr":
+            self.period = "all"
+        self.excluded_tags = plugin._normalize_list(
+            plugin._cfg("recommendation", "exclude_tags", ["韩漫"])
+        )
+        self._excluded_tag_keys = {self._tag_key(tag) for tag in self.excluded_tags}
 
         self.targets = []
         for target in plugin._normalize_list(
@@ -264,27 +298,63 @@ class DailyRecommendation:
             logger.warning(f"每日推荐 JM{state.album_id} 封面暂不可用: {exc}")
             return None
 
+    @staticmethod
+    def _tag_key(tag: str) -> str:
+        text = unicodedata.normalize("NFKC", tag).strip().replace("韓", "韩").casefold()
+        return "韩漫" if text == "hanman" else text
+
+    def _is_excluded(self, tags: list[str]) -> bool:
+        return any(self._tag_key(tag) in self._excluded_tag_keys for tag in tags)
+
     async def _fetch_candidates(self):
         candidates = []
         seen_ids = set()
         page_number = 1
         while len(candidates) < self.top_n:
             page = await self.plugin._fetch_recommendation_page(
-                page_number, self.order_by
+                page_number, self.order_by, self.period
             )
             items = self.plugin._extract_page_results(page)
-            previous_count = len(candidates)
+            # The API can report 韩漫 as a category without repeating it in tags.
+            category_tags = {}
+            for raw in getattr(page, "content", []) or []:
+                if not isinstance(raw, (tuple, list)) or len(raw) < 2:
+                    continue
+                if not isinstance(raw[1], dict):
+                    continue
+                labels = []
+                for key in ("category", "category_sub"):
+                    value = raw[1].get(key)
+                    if isinstance(value, dict):
+                        value = value.get("title") or value.get("id")
+                    if isinstance(value, str):
+                        labels.append(value)
+                category_tags[str(raw[0])] = labels
+            previous_count = len(seen_ids)
             for item in items:
                 if not re.fullmatch(r"[0-9]+", item.album_id):
                     raise ValueError("推荐列表返回了无效的作品 ID")
                 if item.album_id in seen_ids:
                     continue
                 seen_ids.add(item.album_id)
+                if self._is_excluded(item.tags + category_tags.get(item.album_id, [])):
+                    continue
+                if self.excluded_tags:
+                    # Listing tags may be absent or incomplete; validate full details.
+                    album = await self._fetch_detail(item.album_id)
+                    tags = self.plugin._normalize_tags(getattr(album, "tags", []))
+                    if self._is_excluded(tags):
+                        continue
+                    title = str(getattr(album, "name", "") or "").strip()
+                    if not title:
+                        raise ValueError("推荐作品详情缺少标题，请稍后重试")
+                    item.title = title
+                    item.tags = tags
                 candidates.append(item)
                 if len(candidates) == self.top_n:
                     break
             # Stop at an empty/repeated page even if the upstream total is stale.
-            if len(candidates) == previous_count:
+            if len(seen_ids) == previous_count:
                 break
             page_count = self.plugin._page_count(page)
             if page_count is not None and page_number >= page_count:
@@ -331,9 +401,18 @@ class DailyRecommendation:
                     if not candidates:
                         raise ValueError("当前推荐列表暂无可推荐的作品")
                     chosen = random.choice(candidates)
-                    # Persist ID before fetching details so retries cannot select another book.
+                    # Reuse verified details; unfiltered picks retain same-ID detail retries.
                     await self._save(
-                        DailyPick(day, chosen.album_id, source_order=self.order_by)
+                        DailyPick(
+                            day,
+                            chosen.album_id,
+                            title=chosen.title if self.excluded_tags else "",
+                            tags=list(chosen.tags) if self.excluded_tags else [],
+                            details_loaded=bool(self.excluded_tags),
+                            source_order=self.order_by,
+                            source_period=self.period,
+                            source_excluded_tags=list(self.excluded_tags),
+                        )
                     )
                 state = copy.deepcopy(self.state)
                 if not state.details_loaded:
@@ -344,6 +423,10 @@ class DailyRecommendation:
                     state.tags = self.plugin._normalize_tags(getattr(album, "tags", []))
                     state.details_loaded = True
                     await self._save(state)
+                if self._is_excluded(state.tags):
+                    raise ValueError(
+                        "今日缓存推荐命中排除标签，请由管理员执行 /jm重置推荐 后重新抽取"
+                    )
                 cover = await self._cover(state)
                 if self.now().date().isoformat() == day:
                     return copy.deepcopy(state), cover
@@ -351,10 +434,10 @@ class DailyRecommendation:
 
     @staticmethod
     def message(state: DailyPick, cover: bytes | None) -> MessageChain:
-        prefix = (
-            f"JMComic 每日推荐 · {state.day}\n"
-            f"来源: {ORDER_LABELS[state.source_order]}\n"
-        )
+        source = ORDER_LABELS[state.source_order]
+        if state.source_order != "day":
+            source = f"{PERIOD_LABELS[state.source_period]} · {source}"
+        prefix = f"JMComic 每日推荐 · {state.day}\n来源: {source}\n"
         return album_message(state.album_id, state.title, state.tags, cover, prefix)
 
     def _target_allowed(self, target: str) -> bool:
