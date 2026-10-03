@@ -214,7 +214,7 @@ class NapCatHttpDeliveryError(RuntimeError):
     PLUGIN_NAME,
     "Ars1027",
     "JMComic 的 AstrBot 查询与异步下载插件",
-    "v0.4.0",
+    "v0.5.0",
 )
 class JMComicPlugin(Star):
     def _cfg(self, block: str, key: str, default):
